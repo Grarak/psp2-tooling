@@ -66,7 +66,9 @@ DIF_TYPE_CTF, CTF_K_INTEGER = 0, 1
 DIF_VAR_UREGS = 2
 DIF_VAR_TIMESTAMP, DIF_VAR_ARG0, DIF_VAR_PID, DIF_VAR_TID = 0x101, 0x106, 0x116, 0x117
 DIF_SUBR_COPYIN, DIF_TF_BYREF = 8, 1
-MAX_STACK_BYTES, MAX_REGISTER_BUFSIZE = 32768, 4 * 1024 * 1024
+# Two register buffers a CPU on four CPUs come out of SceDeci4pDtracep's 16 MiB pHeap, which
+# does not grow: 4 MiB buffers (32 MiB) panic the DevKit kernel a few windows later.
+MAX_STACK_BYTES, MAX_REGISTER_BUFSIZE = 32768, 512 * 1024
 RAW_CAPTURE_VERSION = 1
 EPROBEDESC = struct.Struct('<IIQIi')         # epid, probe id, uarg, size, nrecs
 RECDESC = struct.Struct('<HHIIHHQQ')         # action, pad, size, offset, alignment, format,
@@ -134,7 +136,7 @@ def profile_dof(hz, pid, bufsize, stack_depth=0, registers=False, stack_bytes=0)
         raise ValueError("Stack bytes must be zero or an aligned extent of 16..32768")
     registers = registers or bool(stack_bytes)
     if registers and not 2 * stack_bytes + 512 <= bufsize <= MAX_REGISTER_BUFSIZE:
-        raise ValueError("Register capture buffer must fit two snapshot extents and be at most 4 MiB")
+        raise ValueError("Register capture buffer must fit two snapshot extents and be at most 512 KiB")
     dof = Dof()
     name = f'profile-{hz}'.encode()
     strtab = b'\0profile\0' + name + b'\0'
@@ -561,7 +563,7 @@ def main():
     parser.add_argument('--hz', type=int, help='samples per second per CPU (default: 997; registers: 199)')
     parser.add_argument('--seconds', type=float, default=10.0)
     parser.add_argument('--interval', type=float, default=0.2, help='buffer read interval')
-    parser.add_argument('--bufsize', type=int, help='per-CPU buffer (default: 256 KiB; registers: 4 MiB)')
+    parser.add_argument('--bufsize', type=int, help='per-CPU buffer (default: 256 KiB; registers: 512 KiB, the most)')
     parser.add_argument('--stack-depth', type=int, default=0, help='native user-stack frames per sample (0 disables, maximum 256)')
     parser.add_argument('--registers', action='store_true', help='record independent raw ARM32 register events')
     parser.add_argument('--stack-bytes', type=int, help='raw bytes at exact user SP (register default: 8192; 0 is registers only; maximum 32768)')
@@ -585,7 +587,7 @@ def main():
     if args.bufsize is None:
         args.bufsize = MAX_REGISTER_BUFSIZE if args.registers else 256 * 1024
     if args.registers and not 2 * args.stack_bytes + 512 <= args.bufsize <= MAX_REGISTER_BUFSIZE:
-        parser.error('register capture buffer must fit two snapshot extents and be at most 4 MiB')
+        parser.error('register capture buffer must fit two snapshot extents and be at most 512 KiB')
 
     pid, base = (loadp_launch(args.deci_log) if args.deci_log else (None, None))
     pid = args.pid if args.pid is not None else pid
