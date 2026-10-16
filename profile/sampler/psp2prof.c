@@ -227,6 +227,10 @@ static int start_sampler(uint32_t hz, uint32_t cores) {
         void *base = NULL;
         ring_uid = ksceKernelAllocMemBlock("psp2prof_ring", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
                                            RING * sizeof(Sample), NULL);
+        // A retail kernel has about 2 MiB of KD free after boot (0x80024302 here): take
+        // kernel RW from PhyCont instead, as the retail port of dtracep does.
+        if (ring_uid < 0)
+            ring_uid = ksceKernelAllocMemBlock("psp2prof_ring", 0x1080d006, RING * sizeof(Sample), NULL);
         if (ring_uid < 0 || ksceKernelGetMemBlockBase(ring_uid, &base) < 0) {
             ksceKernelPrintf("[psp2prof] the sample ring failed: 0x%08X\n", ring_uid);
             ring_uid = -1;

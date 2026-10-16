@@ -1,0 +1,17 @@
+retail_cp:
+  attributes: 0
+  version:
+    major: 0
+    minor: 1
+  main:
+    start: module_start
+    stop: module_stop
+  libraries:
+    SceDbgSdioForDriver:
+      nid: 0x6947917B
+      version: 1
+      functions:
+        - absent_sdio_unbind: 0x361E1BB6
+        - absent_sdio_read: 0x3BA07B2D
+        - absent_sdio_bind: 0x3D3FAF3A
+        - absent_sdio_write: 0xEBD24322

@@ -1,10 +1,11 @@
 # AGENTS.md
 
-How to debug and profile an app on a PS Vita DevKit from Linux with this repo's tools: power
-cycle, launch, profile the CPU and GPU, collect the results, analyze them. It applies to any
-app built with VitaSDK. Each tool's `--help` (or its header docstring) has every option;
-`examples/` has one script per workflow, and the steps below show what those scripts do so
-you can adapt them.
+How to debug and profile an app on a PS Vita DevKit, or a retail Vita with `retail-cp/`
+installed, from Linux with this repo's tools: power cycle, launch, profile the CPU and GPU,
+collect the results, analyze them. It applies to any app built with VitaSDK. Each tool's
+`--help` (or its header docstring) has every option; `examples/` has one script per workflow,
+and the steps below show what those scripts do so you can adapt them. Where a retail Vita
+differs, the step says so (**Retail:**); [Retail Vita](#retail-vita) collects it all.
 
 ## Tools by step
 
@@ -19,7 +20,8 @@ you can adapt them.
 | CPU, whole system (every core, kernel, syscalls) | `profile/sampler/`, `profile/psp2prof.py`, `profile/perf_data.py` | `examples/cpu-profile.sh` |
 | CPU, one process: flat and call stacks | `profile/vita_prof.py`, `profile/unwind_snapshots.py`, `profile/leaf_callers.py`, `profile/perf_data.py` | `examples/call-stacks.sh` |
 | GPU | `razor/recorder/`, `razor/rzlv.py`, `razor/sgx_capture.py` | `examples/razor.sh` |
-| Crashes | `devkit/parse_core.py` | `examples/core-dump.sh` |
+| Crashes | `psp2_input.py ... pdump`, `devkit/parse_core.py` | `examples/core-dump.sh` |
+| Retail: files, resets, reports and uninstall over USB | `devkit/retail_vita.sh` | |
 
 Names used below:
 
@@ -48,6 +50,10 @@ OUT/console.log, OUT/deci4p.log      OUT/launch-N/, HOST0/psp2prof/, HOST0/*.rzl
    over LOADP, the timed actions run T seconds after it, and after `SECONDS` it is killed.
 4. The Vita is powered off, also on Ctrl-C, a `STOP` match or a refused launch.
 
+**Retail:** `RETAIL=1`. Step 1 is a Syscon cold reset through retail-cp over the Vita's USB
+port (`NORESET=1` keeps the running boot), step 2 has no CP console (the console is
+`OUT/tty.log`), launches wait until LOADP is announced, and step 4 leaves the Vita on.
+
 The analysis happens on Linux after the boot. A boot costs about a minute before the app
 starts, so plan what to measure, when (seconds after the launch) and for how long first.
 
@@ -58,6 +64,8 @@ starts, so plan what to measure, when (seconds after the launch) and for how lon
 - **Always power off.** Ctrl-C `session.sh` (or kill the PID in `OUT/session.pid`); it powers
   the Vita off. Never leave the Vita on a static screen while you work something out: the
   OLED burns in. Power off and relaunch later.
+  **Retail:** `session.sh` leaves the Vita on; reset it for a fresh boot instead
+  (`retail_vita.sh reset`).
 - **Small register snapshots.** With `vita_prof.py --registers` pass `--stack-bytes 2048`
   (the tool's default is 8192; stay at 4096 or below), and keep `--stack-depth` at 0, 8 at
   most. Larger stack copies and deeper USTACK walks overrun the stack and freeze the whole
@@ -92,6 +100,17 @@ starts, so plan what to measure, when (seconds after the launch) and for how lon
   `profile/sampler` (`psp2prof.vpk`, title `PSP2PROF0`) and `devkit/vpk_promoter`, and
   installs the VPK. It has to be installed: taiHEN gives the kernel-module load only to
   installed unsafe apps, not to a SELF launched from `host0:`.
+
+## Once per retail Vita
+
+- **Install retail-cp** as the README says (Retail Vita: what you need, build and install).
+  The first copy needs VitaShell or FTP; from then on `devkit/retail_vita.sh put FILE PATH`
+  copies over USB.
+- **Connection:** only the Vita's USB port. **Permissions:** read/write access to `054c:04cd`.
+  `devkit/retail_vita.sh word memory` checks the link (a `memory:` line in its `tty.log`).
+- **psp2prof** installs the same way as on a DevKit (`examples/cpu-profile.sh`, `RETAIL=1`).
+- **Razor snapshots** need an fSELF of the decrypted `librazorcapture_es4` in `ur0:data/`
+  (`razor/recorder/razor.h`).
 
 ## The session step by step
 
@@ -135,6 +154,13 @@ Each request prints its status: `accepted`, or why it was refused (`0x2007` wron
 state, `0x2011` the Syscon link is gated, `0x2014` the Vita holds the power lock).
 `[POWER]` lines in the console show the CP's power events.
 
+**Retail:** there is no CP; retail-cp resets the Vita through Syscon:
+
+```
+devkit/retail_vita.sh reset                                   # waits for the next boot's report
+python3 devkit/devkit_console.py --retail --power reset --wait off --wait on --timeout 200
+```
+
 ### 3. Launch
 
 ```
@@ -172,6 +198,8 @@ python3 devkit/devkit_console.py --power off --wait off --timeout 15 ||
   is open, so a launch sent early waits instead of failing.
 - With no command on its command line, `psp2_input.py` reads one command per line from
   stdin.
+- **Retail:** leave out the `devkit_console.py --follow` line (the console arrives in
+  `$RUN/tty.log`) and the power-off at the end; the Vita stays on.
 
 ### 4. Drive and watch
 
@@ -287,18 +315,20 @@ RUN="60=python3 \$TOOLS/profile/vita_prof.py --socket \$SOCK --deci-log \$DECI_L
 ### 6. Profile the GPU (Razor)
 
 The app records Razor data itself. Add `razor/recorder/razor.cpp`, link
-`SceRazorCapture_stub_weak`, `SceRazorHud_stub_weak`, `ScePamgr_stub`, `SceSysmodule_stub`
-and `SceGxm_stub`, and call the hooks (`razor/recorder/razor.h` lists the options):
+`SceRazorCapture_stub_weak`, `ScePamgr_stub`, `ScePower_stub`, `SceGxm_stub` and
+`SceGpuEs4User_stub` (VitaSDK has none: build it from `razor/recorder/SceGpuEs4User.yml` with
+`vita-libs-gen` and `make`), and call the hooks (`razor/recorder/razor.h` lists the options):
 
 ```
-razor::initialize("live=host0:/gpu.rzlv,hide-hud,group=1,start=600,frames=120");
+razor::initialize("live=host0:/gpu.rzlv,group=1,start=600,frames=120");
 sceGxmInitialize(...);
 for (;;) { draw(); sceGxmPadHeartbeat(...); razor::frame(); }
 sceGxmFinish(ctx); razor::stop(); sceGxmTerminate(); razor::terminate();
 ```
 
-Then `examples/razor.sh HOST0 TITLEID` writes `LIVE=1` into `HOST0/hud_settings.ini`, runs
-the app for 60 s and decodes the result.
+Then `examples/razor.sh HOST0 TITLEID` runs the app for 60 s and decodes the result. The
+recorder drives the Performance Analyzer through pamgr itself (no Razor HUD) and switches the
+SGX's performance counters on, as the HUD does.
 
 - `group=`: 0 parameter buffer, 1 USSE and texture activity, 2 primitive, vertex and pixel
   counts, 3 TA and ISP memory traffic.
@@ -308,8 +338,8 @@ the app for 60 s and decodes the result.
   never in a run you measure.
 - The recorder prints its status to stderr, with the app's output:
   - `razor: <operation> = <status>` for each Razor call;
-  - `razor: native performance mode N (live requires 3)`;
-  - `razor: dropped N live entries` when the buffer overflowed.
+  - a full trace buffer ends the window early: raise `trace-mib=` (default 8, about 2 s of
+    group 1) or shorten `frames=`.
 
 ### 7. Collect
 
@@ -322,7 +352,9 @@ the app for 60 s and decodes the result.
 | `OUT/cp-off.log`, `OUT/deci4p-off.log` | The power-off |
 | `HOST0/psp2prof/NAME.p2pf` | psp2prof captures (`NAME.part` while streaming) |
 | `HOST0/gpu.rzlv`, `HOST0/frame.sgx` | Razor metrics and snapshots |
-| `ux0:data/psp2core-*.psp2dmp` on the Vita | Core dumps; copy them off over FTP or VitaShell |
+| `HOST0/psp2core-*.psp2dmp` | Core dumps written with `pdump` (see Crashes) |
+| `ux0:data/psp2core-*.psp2dmp` on the Vita | Core dumps written while no host served `host0:`; copy them off over FTP or VitaShell, or on retail with `devkit/retail_vita.sh get` |
+| `ur0:data/retail-debug/cp.txt` on a retail Vita | retail-cp's report of the boot (`cp-prev.txt`: the boot before); `devkit/retail_vita.sh get` |
 
 Name each `OUT` after what it measured and keep the ELF with it.
 
@@ -399,6 +431,9 @@ python3 devkit/devkit_console.py --state
 python3 devkit/devkit_console.py --power force-off --wait off --timeout 10
 ```
 
+**Retail:** the Vita stays on between sessions; `devkit/retail_vita.sh reset` gives the next
+session a fresh boot. `power off` is a real power off that only the power button undoes.
+
 ## A typical workflow: a slow section
 
 1. **Find it.** Grabs every 20 s show when the section is on screen. `PRESS=` drives the app
@@ -426,7 +461,18 @@ python3 devkit/devkit_console.py --power force-off --wait off --timeout 10
      `Print Backtrace(User stack)` with `PC:0x... [MODULE + 0xOFFSET]` there.
    - Add the offset to the ELF's text address (VitaSDK links at `0x81000000`) and look it
      up with `$VITASDK/bin/arm-vita-eabi-addr2line -f -C -i -e APP.elf ADDRESS`.
-2. **Read the core dump**, if there is one (`ux0:data/psp2core-*.psp2dmp`, copied off):
+2. **Get a core dump.** In development mode the kernel writes none by itself: the crashed
+   process stays stopped (debug-suspended), and later launches fail (LOADP `0x3003b`, kernel
+   `0x80802025`) until it is killed. Write its core file to `HOST0` over DBGP, as psp2ctrl's `pdump` does, then kill
+   it:
+
+   ```
+   python3 devkit/psp2_input.py SOCK pdump PID          # PID from the launch's LOADP reply
+   python3 devkit/psp2_input.py SOCK pdumpstatus        # "idle last pid ... core file host0:psp2core-..."
+   python3 devkit/psp2_input.py SOCK kill PID
+   ```
+
+3. **Read the core dump** (`HOST0/psp2core-*.psp2dmp`, or `ux0:data/` when no host served it):
 
    ```
    examples/core-dump.sh psp2core-X.psp2dmp APP.elf                               # every thread's backtrace
@@ -435,15 +481,55 @@ python3 devkit/devkit_console.py --power force-off --wait off --timeout 10
    ```
 
    `--backtrace` needs `gdb-multiarch` or `arm-vita-eabi-gdb`.
-3. **Stop at asserts.** Set `STOP` to the assert's text: the session ends at the message and
+4. **Stop at asserts.** Set `STOP` to the assert's text: the session ends at the message and
    powers off. A process stopped in an assert can block the normal shutdown, so
    `session.sh` kills it.
+
+## Retail Vita
+
+The same workflow runs on a retail Vita (PCH-2000, firmware 3.65 only) with `retail-cp/`
+installed (README: what to provide, build and install, what changes on the Vita; RETAIL.md:
+per-tool details). What differs from a DevKit:
+
+- **Only the Vita's USB port.** There is no CP board, mini-USB console or HDMI: the console is
+  the TTY text `deci4p_host.py` receives (`OUT/tty.log`, kernel lines prefixed `[kernel]`), and
+  `GRAB`/`AUDIO` don't apply (`vcp_capture.py` takes screenshots).
+- **`RETAIL=1` for `session.sh` and the examples.** Turn the Vita on and plug in its USB port
+  first. A session starts with a Syscon cold reset through retail-cp (`NORESET=1` keeps the
+  running boot), launches once LOADP is announced (retail-cp starts the Target Manager
+  services after the shell, about 15 s into a boot), and leaves the Vita on at the end.
+- **Power is retail-cp's.** `python3 devkit/psp2_input.py SOCK power reset` (a Syscon cold
+  reset, which works with the shell hung) and `power reboot`; `devkit_console.py --retail
+  --power reset --wait off --wait on` does the same without a running host. `power off` is a
+  real power off: only the power button brings the Vita back, so don't use it in unattended
+  runs.
+- **Files and resets without a session:** `devkit/retail_vita.sh get PATH`, `put FILE PATH`,
+  `list DIR`, `reset`, `word WORD...` (the USB link alone; no FTP or network server needed).
+  `ur0:data/retail-debug/cp.txt` is retail-cp's report of the boot; `cp-prev.txt` the boot
+  before.
+- **Crashes stop, as on a DevKit in development mode** (see Crashes): `pdump PID`, then
+  `kill PID`. A crashed shell freezes the screen with the link still up: `pdump` its process
+  if you need it, then `retail_vita.sh reset`. A kernel exception restarts the Vita by itself
+  and leaves a `crash=` line in the next boot's `cp.txt`.
+- **Retail-only words** through `psp2_input.py SOCK power ...`: `threads` (every thread's
+  state to `tty.log`), `memory` (free kernel memory), `hwbp`/`hwwp PID ADDRESS` (a hardware
+  breakpoint or watchpoint in a process; ADDRESS may be `MODULE+OFFSET`).
+- **psp2prof** works as on a DevKit (install `PSP2PROF0` once). **Razor snapshots** need an
+  fSELF of the decrypted `librazorcapture_es4` in `ur0:data/` (razor.h).
+- **Uninstall** with `devkit/retail_vita.sh uninstall` (README): it is the only way to clear
+  development mode and hardware debug from Syscon; never take retail-cp out of `config.txt` by
+  hand.
+- **One owner** applies to the USB port too: stop any `deci4p_host.py` (`retail_vita.sh`
+  starts one and leaves it running) before `session.sh` or `devkit_console.py --retail`.
 
 ## Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
 | `waiting for 054c:0432` | The CP board's mini-USB isn't attached, Target Manager holds it, or permissions are missing. |
+| Retail: `retail: no reset (is retail-cp loaded?)` | retail-cp isn't under `*KERNEL` in `ur0:tai/config.txt`, or another `deci4p_host.py` holds the port. |
+| Retail: no DECI4p link (`no DECI4p link` from `retail_vita.sh`) | Another host holds the port, or the Vita hasn't finished booting (TTYP7 opens after the shell, about 30 s after a reset). |
+| `launch refused` with `0x3003b` (kernel `0x80802025`) | A crashed process is still stopped: `pdump` it if you want its core file, then `kill` it. |
 | `the Vita's USB (054c:04cd) did not appear` | The Vita didn't boot, or the cable or permissions are wrong. Check with `devkit_console.py --state`. |
 | `launch refused` | The `LOADP reply` line names the result, for example `no such file, or the path is not allowed` or `no such process or title`. |
 | A power request refused with `0x2014` | The Vita holds the power lock, often a running app. Start `deci4p_host.py`, `psp2_input.py SOCK kill TITLEID`, then `--power force-off --wait off`. |
@@ -453,6 +539,5 @@ python3 devkit/devkit_console.py --power force-off --wait off --timeout 10
 | A profile without the app's samples | It crashed (see Crashes), the pid came from another launch, or psp2prof never printed `ready`. |
 | Wrong or missing symbols | Not the ELF of this build. For psp2prof, the module name differs from the ELF's file name: pass `--module`. |
 | `psp2prof.py`: `no ... after N s; the request was not taken` | `PSP2PROF0` wasn't launched this boot, or `HOST0` isn't the directory `deci4p_host.py` serves. With `was taken`, the capture failed: see the `[psp2prof]` lines. |
-| Razor `STAT 0x8008c008` / `0x8008c002` | `HOST0/hud_settings.ini` is missing / doesn't say `LIVE=1`. |
 | A black or old HDMI grab | The app wasn't up at T, `CAPDEV` isn't the capture card, or the card can't deliver MJPEG 1280x720 at 60 fps. |
 | Promotion fails with `0x8010111C` | The package has no header. Stage it with `vpk_promoter/stage.py`. |

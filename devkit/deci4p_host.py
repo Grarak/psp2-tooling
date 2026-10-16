@@ -41,12 +41,18 @@ PACKET_MAX = 0x11000
 
 NODE_PC = 0x4000
 NODE_CP = 0x6000
+CONNECT_RETRY = 5.0          # seconds without any answer from DfMgr before connecting again
 NODE_VITA_SDIO = 0xA000
 NODE_VITA_USB = 0xA100
 
 PROTOCOL_DCMP = 0x00000100
 PROTOCOL_DRFP = 0x00011100
 
+
+# The TTYP7 words retail-cp acts on (see the "power" control command): power states, the QA
+# flag unlock, and reports.
+POWER_WORDS = ('reset', 'reboot', 'off', 'suspend', 'wake', 'qaf', 'scratch', 'threads', 'memory', 'debugmem',
+               'uninstall')
 
 class Deci4pStream:
     """Splits the byte stream into DECI4p packets and frames replies."""
@@ -85,7 +91,7 @@ class Deci4pStream:
                 if self.synced:
                     raise ValueError(f'bad DECI4p header {bytes(self.buffer[:16]).hex()}')
                 # A link killed mid-transfer can leave the rest of a packet in the Vita's IN
-                # endpoint (zeros after the hold1800 run's psp2test link): skip to the next
+                # endpoint (zeros): skip to the next
                 # byte that could start a header (the magic is the word's top byte).
                 skip = self.buffer.find(bytes([HEADER_MAGIC]), 4) - 3
                 skip = skip if skip > 0 else max(len(self.buffer) - 3, 1)
@@ -921,18 +927,130 @@ class LoadpClient:
         self.queue.clear()
 
 
+PROTOCOL_DBGP = 0x00020000
+
+# DBGP sub-header at payload +0x00: version 1, a command group, the opcode, a tag the reply
+# echoes; then a pid (requests) and, in replies, the result. A reply's opcode is the request's
+# plus one; a failed request's reply carries the error in the result word.
+DBGP_HDR = struct.Struct('<BBBBII')
+DBGP_PROCESS = 0x20               # group: process list, attach and detach
+DBGP_ATTACH = 0x10
+DBGP_DETACH = 0x12
+DBGP_COREDUMP = 0x80              # group: core dumps
+DBGP_DUMP = 0x00
+DBGP_DUMP_DONE = 0x20             # notice: pid, dump id, status, the core file's path
+DBGP_DUMP_PROGRESS = 0x22         # notice: pid, dump id, percent
+DBGP_ALREADY_ATTACHED = 0x20052
+DBGP_DEST_HOST0 = 1               # SceCoredump's destination 1: host0:
+DBGP_LEVELS = {'full': 0, 'mini': 1}   # the wire's words; left out, the Dump Level setting holds
+
+
+class DbgpClient:
+    """The PC's end of DBGP, the debugger protocol: what psp2ctrl's pdump does.
+
+    A DevKit in development mode writes no core file when an application crashes: the
+    process stays stopped (debug-suspended) for Target Manager. pdump attaches to it,
+    which gives the process a DBGP session of its own, asks that session for a core dump
+    to host0: (served here, DRFP), waits for the dump's notice and detaches. Kill the
+    process afterwards with LOADP.
+    """
+
+    def __init__(self, send, note):
+        self.send = send
+        self.note = note
+        self.tag = 0
+        self.job = None             # [pid, level, step]
+        self.last = 'no core dump'
+
+    def request(self, group, opcode, pid, body=b''):
+        self.tag = (self.tag + 1) & 0xFF
+        self.note(f'DBGP request {group:#04x}/{opcode:#04x} pid {pid:#x}')
+        self.send(DBGP_HDR.pack(1, group, opcode, self.tag, pid, 0) + body)
+
+    def pdump(self, pid, level=None):
+        if self.job is not None:
+            raise ValueError(f'a core dump of pid {self.job[0]:#x} is under way')
+        self.job = [pid, level, 'attach']
+        self.last = f'pid {pid:#x} attaching'
+        self.request(DBGP_PROCESS, DBGP_ATTACH, pid, struct.pack('<I', 0))
+
+    def dump(self):
+        pid, level, _ = self.job
+        self.job[2] = 'dump'
+        self.last = f'pid {pid:#x} dumping'
+        # Destination, path length (no path: SceCoredump names the file), then the level.
+        body = struct.pack('<III', 0, DBGP_DEST_HOST0, 0)
+        if level is not None:
+            body += struct.pack('<I', DBGP_LEVELS[level])
+        self.request(DBGP_COREDUMP, DBGP_DUMP, pid, body)
+
+    def detach(self):
+        self.job[2] = 'detach'
+        self.request(DBGP_PROCESS, DBGP_DETACH, self.job[0], struct.pack('<I', 0))
+
+    def finish(self, text):
+        self.last = text
+        self.note(f'DBGP pdump: {text}')
+        self.job = None
+
+    def receive(self, payload):
+        if len(payload) < DBGP_HDR.size:
+            return
+        _, group, opcode, _, _, result = DBGP_HDR.unpack_from(payload)
+        words = struct.unpack_from(f'<{(len(payload) - 12) // 4}I', payload, 12)
+        self.note(f'DBGP {group:#04x}/{opcode:#04x} result {result:#x} '
+                  + ' '.join(f'{word:#x}' for word in words[:6]))
+        job = self.job
+        if group == DBGP_COREDUMP and opcode == DBGP_DUMP_DONE and len(words) >= 5:
+            pid, _, _, status, length = words[:5]
+            path = payload[0x20:0x20 + length].split(b'\0')[0].decode('utf-8', 'replace')
+            if job is not None and job[0] == pid and job[2] == 'dump':
+                self.last = (f'pid {pid:#x} core file {path}' if status == 0
+                             else f'pid {pid:#x} core dump failed {status:#x}')
+                self.detach()
+            return
+        if job is None or opcode & 1 == 0:
+            return
+        step = job[2]
+        if step == 'attach' and (group, opcode) == (DBGP_PROCESS, DBGP_ATTACH + 1):
+            if result in (0, DBGP_ALREADY_ATTACHED):
+                self.dump()
+            else:
+                self.finish(f'pid {job[0]:#x} attach failed {result:#x}')
+        elif step == 'dump' and (group, opcode) == (DBGP_COREDUMP, DBGP_DUMP + 1) and result:
+            self.last = f'pid {job[0]:#x} core dump refused {result:#x}'
+            self.detach()
+        elif step == 'detach' and (group, opcode) == (DBGP_PROCESS, DBGP_DETACH + 1):
+            self.finish(self.last + ('' if result == 0 else f' (detach {result:#x})'))
+
+    def close(self):
+        if self.job is not None:
+            self.finish(f'pid {self.job[0]:#x}: the link closed')
+
+
 PROTOCOL_TTYP = 0x80030000
 TTYP_PORTS = 8
-TTYP_HEADER = 0x2c          # the text follows; its length is at +0x28
+TTYP_HEADER = 0x1c          # after the DECI4p header; the text follows, its length at +0x18
+
+
+# retail-cp's power port: the last console, which no process writes.
+POWER_TTYP = 7
+
+
+def tty_input(text):
+    """A TTYP input packet's payload: the output layout, read back by the port's tty reader."""
+    data = text.encode()
+    return bytes(TTYP_HEADER - 4) + struct.pack('<I', len(data)) + data
 
 
 class TtyServer:
     """TTYP0-7, the Vita's console ports.
 
-    Kernel console writes and processes' stdout arrive as kind 0 packets: +0x10 origin
-    (0x1000 a process or user thread, 0x8000 the kernel), +0x12 kind, +0x14 pid,
-    +0x28 length, +0x2c text.  Kind 2 is ttyp's notice that a process exited or was
-    killed.  Each port's text goes to tty.log, one "[TTYPn pid]" prefix per line.
+    Kernel console writes and processes' stdout arrive as kind 0 packets; after the
+    16-byte DECI4p header: +0x00 origin (0x1000 a process or user thread, 0x8000 the
+    kernel), +0x02 kind, +0x04 pid, +0x18 length, +0x1c text.  Kind 2 is ttyp's notice
+    that a process exited or was killed.  Each port's text goes to tty.log, one
+    "[TTYPn pid]" prefix per line.
     """
 
     def __init__(self, port, log, note):
@@ -944,8 +1062,8 @@ class TtyServer:
     def receive(self, payload):
         if len(payload) < TTYP_HEADER:
             return
-        origin, kind, _, pid = struct.unpack_from('<HBBI', payload, 0x10)
-        length = struct.unpack_from('<I', payload, 0x28)[0]
+        origin, kind, _, pid = struct.unpack_from('<HBBI', payload, 0)
+        length = struct.unpack_from('<I', payload, TTYP_HEADER - 4)[0]
         if kind == 2:
             self.note(f'TTYP{self.port} pid {pid:#x} exited')
             return
@@ -1031,10 +1149,12 @@ class TargetManager:
         self.wait_for_ready = getattr(args, 'wait_for_ready', False)
         self.ctrlp = CtrlpClient(self.sender(PROTOCOL_CTRLP), stream.note)
         self.loadp = LoadpClient(self.sender(PROTOCOL_LOADP), stream.note)
+        self.dbgp = DbgpClient(self.sender(PROTOCOL_DBGP), stream.note)
         self.servers = {
             PROTOCOL_DRFP: DrfpServer(args.host0, self.sender(PROTOCOL_DRFP), stream.note),
             PROTOCOL_CTRLP: self.ctrlp,
             PROTOCOL_LOADP: self.loadp,
+            PROTOCOL_DBGP: self.dbgp,
         }
         tty_log = getattr(args, 'tty_log', None)
         for port in range(TTYP_PORTS):
@@ -1046,15 +1166,25 @@ class TargetManager:
         self.launch = list(getattr(args, 'launch', None) or [])
         self.launch_after = getattr(args, 'launch_after', 0.0)
         self.launch_at = None
+        # The connect is repeated while DfMgr sends nothing at all (connect_due).
+        self.answered = False
+        self.connect_at = None
 
     def next_timeout(self):
         """Seconds until a timed press has to be released or --launch is due, or None."""
-        due = [at for at in (self.release_at, self.launch_at) if at is not None]
+        due = [at for at in (self.release_at, self.launch_at, self.connect_due()) if at is not None]
         if not due:
             return None
         return max(0.0, min(due) - time.monotonic())
 
+    def connect_due(self):
+        return None if self.answered or self.connect_at is None else self.connect_at + CONNECT_RETRY
+
     def run_timers(self):
+        due = self.connect_due()
+        if due is not None and time.monotonic() >= due:
+            self.stream.note(f'DCMP: no answer {CONNECT_RETRY:g} s after the connect, connecting again')
+            self.connect()
         if self.release_at is not None and time.monotonic() >= self.release_at:
             self.release_at = None
             self.ctrlp.set_pad(0)
@@ -1158,9 +1288,28 @@ class TargetManager:
                 self.loadp.launch(word[1], word[2:], appmgr=word[0] == 'launch')
                 return (f'ok {word[0]} {word[1]}; the reply is in the packet log'
                         + ('' if self.loadp.open else ', once the Vita opens LOADP'))
+            if word[0] == 'power' and ((len(word) == 2 and word[1] in POWER_WORDS)
+                                       or (len(word) == 4 and word[1] == 'copy')
+                                       or (len(word) == 3 and word[1] == 'list')
+                                       or (len(word) in (4, 5) and word[1] in ('hwbp', 'hwwp'))):
+                # A retail Vita has no CP to cut power: retail-cp reads TTYP7's input and asks
+                # Syscon (retail-cp/words.c). "copy SRC DST" moves a file
+                # over this link (host0: is DRFP), "list DIR" lists a directory, and "hwbp" and
+                # "hwwp PID ADDRESS [CONTROL]" set a process's hardware breakpoint and watchpoint.
+                text = ' '.join(word[1:])
+                self.sender(PROTOCOL_TTYP + POWER_TTYP)(tty_input(text + '\n'))
+                return f'ok power {text}; the result is on the kernel console'
             if word[0] == 'kill' and len(word) == 2:
                 self.loadp.kill(word[1])
                 return f'ok kill {word[1]}; the reply is in the packet log'
+            if word[0] == 'pdump' and len(word) in (2, 3):
+                # A stopped (crashed) process's core file, to host0:, as psp2ctrl pdump.
+                if len(word) == 3 and word[2] not in DBGP_LEVELS:
+                    raise ValueError('LEVEL must be full or mini')
+                self.dbgp.pdump(int(word[1], 0), word[2] if len(word) == 3 else None)
+                return f'ok pdump {word[1]}; "pdumpstatus" tells when the file is written'
+            if word[0] == 'pdumpstatus' and len(word) == 1:
+                return f'ok {"busy" if self.dbgp.job else "idle"} last {self.dbgp.last}'
             module_commands = {'moduleload': 0x10, 'modulestart': 0x12,
                                'modulestop': 0x14, 'moduleunload': 0x16}
             if word[0] in module_commands and len(word) == 3:
@@ -1188,7 +1337,8 @@ class TargetManager:
                 'pad BUTTONS LX LY RX RY | playpad PORT BUTTONS LX LY RX RY | '
                 'playpress BUTTONS | playstop | touch X Y [FORCE] | untouch | status | '
                 'launch PATH_OR_TITLEID [ARG...] | spawn PATH [ARG...] | connect | echo HEX | '
-                'kill PID_OR_TITLEID | launchstatus | moduleload PID PATH | '
+                'kill PID_OR_TITLEID | launchstatus | pdump PID [full|mini] | pdumpstatus | '
+                'moduleload PID PATH | '
                 'modulestart PID ID | modulestop PID ID | moduleunload PID ID | '
                 'pipe PROTOCOL (the connection then carries binary frames)')
 
@@ -1205,7 +1355,12 @@ class TargetManager:
             raise ValueError(f'the Vita has not announced protocol {protocol:#x}')
         server.attach(client)
         if not status & 2:
+            # A 0/4 is never acknowledged on the wire, so the announced status keeps saying
+            # closed: remember the open, or every later pipe re-opens the protocol. A second
+            # 0/4 for DTRACEP, right before the next session's first packet, hangs a real
+            # PCH-2000.
             self.dcmp(0, 4, struct.pack('<I', protocol))
+            self.announced[protocol] = status | 2
         return server
 
     def sender(self, protocol):
@@ -1220,6 +1375,20 @@ class TargetManager:
         if self.wait_for_ready:
             self.stream.note('waiting for a genuine manager ready/status announcement')
             return
+        self.connect()
+
+    def connect(self):
+        """Disconnect, then connect: DfMgr replays a 2/1 for every registered protocol.
+
+        Early in a boot nothing is registered yet and the replay is empty; each protocol sends its
+        2/1 when it registers. connect_due repeats the pair only while the Vita sends nothing at
+        all: a 0/1 makes DfMgr tell every client it disconnected, and ttyp drops a port's
+        pending input then. (A link that stayed silent after the PC's first transfers was
+        dbgusb's lost wakeup, fixed in retail-cp, dbgusb_wake_pending.)
+        """
+        self.vita_managers.add(self.vita_node)
+        self.answered = False
+        self.connect_at = time.monotonic()
         self.dcmp(0, 1)
         self.dcmp(0, 0)
 
@@ -1234,6 +1403,12 @@ class TargetManager:
         server.receive(payload)
 
     def receive_dcmp(self, src, payload):
+        self.handle_dcmp(src, payload)
+        # After the handling: a 0x0F/1 that answers this host's own connect must not connect again.
+        if len(payload) >= 4 and payload[0] == 2:
+            self.answered = True
+
+    def handle_dcmp(self, src, payload):
         if len(payload) < 4:
             return
         kind, code = payload[0], payload[1]
@@ -1274,7 +1449,13 @@ class TargetManager:
                 # 0x8E/0 for unit 1 needs its 0/6 again or DfMgr answers busy to
                 # ScePower forever (2026-09-22).
                 self.disconnecting_units.clear()
-                self.dcmp(0, 0)
+                if (subject, state) == (0x0E, 1):
+                    # The resume waits for a plain 0/0 (no 0/1 first).
+                    self.dcmp(0, 0)
+                elif self.answered:
+                    # DfMgr's link came up again under a connected host: connect afresh.
+                    self.connect()
+                # else it is the answer to the connect under way.
             elif subject in (0x8E, 0x8F) and state == 0:
                 # Sony Target Manager performs a temporary target disconnect here. On the
                 # direct Vita USB link 0/1 or 0/3 goes straight to DfMgr. Across the CP link,
@@ -1323,7 +1504,11 @@ class UsbLink:
         if device is None:
             raise RuntimeError(
                 f'no {USB_VENDOR:04x}:{product:04x} on this machine')
-        interface = device.get_active_configuration()[(0, 0)]
+        # DECI4p is the vendor interface: on retail other plugins' USB functions can share the
+        # device ahead of it (udcd_uvc's video interfaces), and their kernel drivers stay bound.
+        configuration = device.get_active_configuration()
+        interface = (usb.util.find_descriptor(configuration, bInterfaceClass=0xff) or
+                     configuration[(0, 0)])
         if device.is_kernel_driver_active(interface.bInterfaceNumber):
             device.detach_kernel_driver(interface.bInterfaceNumber)
 
@@ -1357,11 +1542,21 @@ class UsbLink:
         return self.host.recv(size)
 
     def sendall(self, data):
-        self.writer_endpoint.write(data, self.timeout)
-        # SceDbgUsb ends an OUT transfer on a short packet, so a packet-sized
-        # write needs a zero-length one to say the transfer is over.
-        if len(data) % self.packet == 0:
-            self.writer_endpoint.write(b'', self.timeout)
+        import usb.core
+
+        try:
+            self.writer_endpoint.write(data, self.timeout)
+            # SceDbgUsb ends an OUT transfer on a short packet, so a packet-sized
+            # write needs a zero-length one to say the transfer is over.
+            if len(data) % self.packet == 0:
+                self.writer_endpoint.write(b'', self.timeout)
+        except usb.core.USBTimeoutError:
+            # dbgusb takes no OUT transfer while one of its IN transfers waits for a PC that
+            # is gone (a host killed mid-link): the link stays stuck,
+            # whatever is sent. A port reset restarts the device's endpoints; the next host
+            # connects as after a replug.
+            self.device.reset()
+            raise RuntimeError('the Vita took no USB write: its port was reset, start the host again')
 
     def read_endpoint(self):
         import usb.core
@@ -1371,7 +1566,8 @@ class UsbLink:
                 data = self.reader_endpoint.read(self.packet, self.timeout)
             except usb.core.USBTimeoutError:
                 continue
-            except usb.core.USBError:
+            except usb.core.USBError as error:
+                print(f'USB read: {error}', file=sys.stderr, flush=True)
                 break
             try:
                 if data:

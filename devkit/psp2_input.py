@@ -40,6 +40,17 @@ Commands:
     spawn PATH [ARG...]      start a SELF as a bare process, without SceAppMgr
     kill PID_OR_TITLEID      end a process or a running title
     launchstatus             whether LOADP is open, and the last launch's result
+    pdump PID [full|mini]    a stopped (crashed) process's core file to host0:, through DBGP
+    pdumpstatus              whether a pdump is under way, and the last one's core file
+    power WORD               a retail Vita (the retail-cp plugin, retail-cp/) only: reset
+                             (Syscon cold reset, the power cycle), reboot (clean
+                             cold reset through the OS) or off (power off)
+    power copy SRC DST       retail: copy one file on the Vita, such as host0:/x to
+                             ur0:tai/x (host0: is the directory deci4p_host serves)
+    power list DIR           retail: a directory's entries, on the kernel console
+    power uninstall          retail: clear development mode and hardware debug, delete
+                             retail-cp's files and restart (devkit/retail_vita.sh uninstall
+                             first takes retail-cp out of config.txt)
 
 BUTTONS is a name, several joined with '+', or a number: select, start, up, right,
 down, left, l, r, l2, r2, l3, r3, triangle, circle, cross, square, ps, volup,

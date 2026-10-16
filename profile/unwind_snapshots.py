@@ -314,7 +314,7 @@ def analyze(info_path,elf_path,output,max_depth=64):
     info,rows,samples = read_capture(info_path)
     elf = VitaElf(elf_path,info['recorded_elf_sha256'])
     require(type(info['loaded_text_base']) is int and info['loaded_text_base'] == elf.base,
-            'Relocated/unknown ET_EXEC load base is unsupported')
+            'Relocated/unknown ET_EXEC load base is unsupported (build the SELF with vita-make-fself -na)')
     original_sha = elf.sha256
     path = str(elf.path.resolve())
     mappings = [engine.Mapping(0,s.address,s.size,s.offset,5,path,'') for s in elf.code]

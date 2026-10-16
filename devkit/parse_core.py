@@ -403,14 +403,16 @@ class Symbols:
             kind, _, address, _, _, memsz, _, _ = struct.unpack_from('<8I', raw, phoff + index * phentsize)
             if kind == 1:
                 loads.append((address, memsz))
-        # The module loaded at the ELF's address (an executable), else the
-        # one whose first segment has the ELF's size (relocated: a PRX).
-        def matches(module, exact):
-            if not module['segments'] or not loads:
-                return False
-            first = module['segments'][0]
-            return first['start'] == loads[0][0] if exact else abs(first['size'] - loads[0][1]) < 0x10000
-        found = [m for m in modules if matches(m, True)] or [m for m in modules if matches(m, False)]
+        # The module loaded at the ELF's address (a DevKit executable), else the one named
+        # after the ELF, else the one whose first segment is closest to the ELF's size
+        # (relocated: a PRX, or a retail executable, which loads at 0x81000000 plus a slide).
+        def size_gap(module):
+            return abs(module['segments'][0]['size'] - loads[0][1])
+        candidates = [m for m in modules if m['segments']] if loads else []
+        stem = Path(elf).stem.replace('-', '_')
+        found = ([m for m in candidates if m['segments'][0]['start'] == loads[0][0]] or
+                 [m for m in candidates if m['name'] == stem] or
+                 sorted((m for m in candidates if size_gap(m) < 0x10000), key=size_gap))
         if found:
             for (address, memsz), segment in zip(loads, found[0]['segments']):
                 self.ranges.append((segment['start'], segment['start'] + memsz, address - segment['start']))
@@ -520,7 +522,26 @@ def write_gdb_core(core, decoded, path):
     return threads
 
 
-def gdb_backtraces(core, decoded, elf, depth):
+def load_command(elf, symbols):
+    """gdb's command to load the ELF where the dumped module sits: each section by its segment's slide."""
+    slides = {bias for _, _, bias in symbols.ranges} if symbols else set()
+    if not slides or slides == {0}:
+        return 'file %s' % elf
+    raw = Path(elf).read_bytes()
+    shoff, = struct.unpack_from('<I', raw, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', raw, 46)
+    headers = [struct.unpack_from('<10I', raw, shoff + i * shentsize) for i in range(shnum)]
+    strings = headers[shstrndx][4]
+    sections = []
+    for name, _, flags, address, _, size, _, _, _, _ in headers:
+        bias = next((b for start, end, b in symbols.ranges if start <= address - b < end), None)
+        if flags & 2 and size and bias is not None:  # SHF_ALLOC
+            label = raw[strings + name:raw.index(b'\0', strings + name)].decode()
+            sections.append('-s %s %#x' % (label, address - bias))
+    return 'add-symbol-file %s %s' % (elf, ' '.join(sections))
+
+
+def gdb_backtraces(core, decoded, elf, symbols, depth):
     gdb = next((t for t in ('gdb-multiarch', 'arm-vita-eabi-gdb') if shutil.which(t)), None)
     if not gdb:
         return 'gdb-multiarch not found'
@@ -528,10 +549,12 @@ def gdb_backtraces(core, decoded, elf, depth):
         path = Path(directory) / 'core'
         write_gdb_core(core, decoded, path)
         command = [gdb, '-nx', '-batch', '-ex', 'set pagination off', '-ex', 'set osabi GNU/Linux',
-                   '-ex', 'set auto-load safe-path /', '-ex', 'file %s' % elf, '-ex', 'core-file %s' % path,
-                   '-ex', 'thread apply all bt %d' % depth]
+                   '-ex', 'set auto-load safe-path /', '-ex', load_command(elf, symbols),
+                   '-ex', 'core-file %s' % path, '-ex', 'thread apply all bt %d' % depth]
         result = subprocess.run(command, capture_output=True, text=True)
-        return result.stdout + result.stderr
+        # add-symbol-file echoes every section address it was given.
+        return ''.join(line for line in (result.stdout + result.stderr).splitlines(keepends=True)
+                       if not line.startswith(('add symbol table from file', '\t.')))
 
 
 # Report
@@ -588,7 +611,7 @@ def report(core, decoded, symbols, args):
     if args.backtrace:
         p('')
         p('=== GDB BACKTRACES ===')
-        p(gdb_backtraces(core, decoded, args.elf, args.stack_depth).rstrip())
+        p(gdb_backtraces(core, decoded, args.elf, symbols, args.stack_depth).rstrip())
     p('')
     p('=== MODULES ===')
     for m in modules:

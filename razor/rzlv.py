@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Decode Sony Razor GPU Live results (.rzlv, razor/recorder) and export a timeline.
+"""Decode Razor GPU live results (.rzlv, razor/recorder) and export a timeline.
 
-RZLV keeps Sony's native GPU job and counter records. GPU busy durations are
-interval unions; sums of core durations are named core_us. The timeline export
+RZLV keeps the Performance Analyzer's raw GPU trace (PACF, PATR); it is decoded
+here into each GPU core's TA, 3D and firmware busy intervals the way Sony's Razor
+HUD does. Older captures hold the HUD's own job records (BATS, DATA) instead.
+GPU busy durations are interval unions; sums of core durations are named core_us. The timeline export
 (--trace: Chrome trace-event JSON for ui.perfetto.dev or chrome://tracing) maps
 the GPU's PA clock into kernel microseconds through the recorded clock anchors,
 never through EndScene/Finish CPU wait times. Optional CPUX spans measure CPU
@@ -21,6 +23,17 @@ from pathlib import Path
 JOB_SIZE = 0x48
 VERTEX_TYPES = {1, 3, 5, 7}
 FRAGMENT_TYPES = {2, 4, 6, 8}
+
+# The PA trace: 128-byte blocks of a u16 sequence, seven u16 tags (high byte: entry type,
+# bit 7 overflow; low byte: the entry's index in its sample) and seven 16-byte entries.
+# A GPU sample (0x61) starts with a 48-bit timestamp in PA ticks and five u16 counters;
+# its further entries hold eight counters each. The counters run core by core, each core
+# in its selects' bit order (selectsA, then selectsB). In every metrics group selectsB
+# bits 24, 25 and 26 are the core's vertex, fragment and firmware busy GPU cycles in the
+# sample period; SceRazorHud (FUN_81008680) reports them as these job types.
+PA_BLOCK = 128
+PA_GPU_SAMPLE, PA_EVENT = 0x61, 0x7f
+GROUP_JOB_TYPES = {0: (7, 8), 1: (1, 2), 2: (3, 4), 3: (5, 6)}
 
 
 def records(data, magic):
@@ -119,10 +132,107 @@ SCENE_FIELDS = ['heartbeat', 'ordinal', 'native_frame', 'notification_serial',
                 'pass_switches', 'flush_transitions', 'reserved']
 
 
+def gpu_hz(mhz):
+    # The HUD's correction: the 166 MHz setting runs at 166.5 MHz.
+    return 166_500_000 if mhz == 166 else mhz * 1_000_000
+
+
+def decode_pa(capture):
+    """SceRazorHud's job edges (FUN_810082b8) over the raw GPU samples.
+
+    A counter is the core's busy cycles in one sample period of P cycles. An open job
+    ends when the core was busy for less than the period: at the sample time plus the
+    busy cycles. A new job starts when the core was busy at all: at the sample time plus
+    the idle cycles. Jobs still open when a trace segment ends close there, truncated.
+    """
+    config = capture['pa_config']
+    selects_a, selects_b = config['selects_a'], config['selects_b']
+    if selects_b >> 24 & 7 != 7 or config['group'] not in GROUP_JOB_TYPES:
+        raise ValueError('PA trace without the busy counters')
+    per_core = bin(selects_a).count('1') + bin(selects_b).count('1')
+    first = bin(selects_a).count('1') + bin(selects_b & 0xffffff).count('1')
+    vertex, fragment = GROUP_JOB_TYPES[config['group']]
+    kinds = ((first, vertex, 'TA'), (first + 1, fragment, '3D'), (first + 2, 0, 'firmware'))
+    pa_mhz, period = config['pa_mhz'], config['period']
+    jobs, bookmarks = capture['pa_jobs'], capture['pa_bookmarks']
+
+    def finish(job, end, truncated=False):
+        job['end_us'] = end // pa_mhz
+        job['duration_us'] = job['end_us'] - job['start_us']
+        if truncated:
+            job['truncated'] = True
+        jobs.append(job)
+
+    segments = {}
+    for batch, data in capture['pa_chunks']:
+        segments.setdefault(batch['segment'], []).append((batch, data))
+    for chunks in segments.values():
+        open_jobs, sample, sequence, last_end = {}, None, None, None
+        for batch, data in chunks:
+            hz = gpu_hz(batch['gpu_mhz'] or config['gpu_mhz'])
+            cycles = hz * period // (pa_mhz * 1_000_000)
+            ticks = lambda value: pa_mhz * 1_000_000 * value // hz
+            for offset in range(0, len(data) - PA_BLOCK + 1, PA_BLOCK):
+                block = data[offset:offset + PA_BLOCK]
+                number = struct.unpack_from('<H', block)[0]
+                if sequence is not None and number != (sequence + 1) & 0xffff:
+                    batch['overflow_count'] += (number - sequence - 1) & 0xffff
+                    sample = None
+                sequence = number
+                for slot, tag in enumerate(struct.unpack_from('<7H', block, 2)):
+                    kind, index, entry = tag >> 8 & 0x7f, tag & 0xff, block[16 + slot * 16:32 + slot * 16]
+                    if kind == PA_EVENT and entry[0xb] & 0x1f == 0x12:
+                        bookmarks.append(dict(sequence=number, value=f'0x{struct.unpack_from("<I", entry, 12)[0]:08x}'))
+                    if kind != PA_GPU_SAMPLE:
+                        continue
+                    if tag & 0x8000:
+                        batch['overflow_count'] += 1
+                        sample = None
+                    elif index == 0:
+                        low, high, *values = struct.unpack('<IH5H', entry)
+                        sample = [low | high << 32, values, 1]
+                    elif sample and index == sample[2]:
+                        sample[1] += struct.unpack('<8H', entry)
+                        sample[2] += 1
+                    else:
+                        sample = None
+                    if not sample or len(sample[1]) < per_core * 4:
+                        continue
+                    time, counters, _ = sample
+                    sample = None
+                    batch['entry_count'] += 1
+                    batch['start_us'] = batch['start_us'] or time // pa_mhz
+                    last_end = time + ticks(cycles)
+                    batch['end_us'] = last_end // pa_mhz
+                    for core in range(4):
+                        for counter, job_type, stage in kinds:
+                            value = counters[core * per_core + counter]
+                            job = open_jobs.get((core, stage))
+                            if job:
+                                if value < cycles:
+                                    finish(open_jobs.pop((core, stage)), time + ticks(value))
+                            elif value:
+                                open_jobs[core, stage] = dict(
+                                    entry_type=0, start_us=(time + ticks(max(cycles - value, 0))) // pa_mhz,
+                                    job_type=job_type, core=core, stage=stage, pid=None, scene=None,
+                                    frame=None, source='PA busy counters')
+        for job in open_jobs.values():
+            finish(job, last_end, truncated=True)
+    jobs.sort(key=lambda job: (job['start_us'], job['core']))
+    # A job's frame: the heartbeats completed when it started, from the per-heartbeat anchors.
+    marks = sorted((clock['pa_ticks'] // clock['frequency_mhz'], clock['heartbeat'])
+                   for clock in capture['clocks'] if clock['heartbeat'] and clock['frequency_mhz'])
+    times = [time for time, _ in marks]
+    for job in jobs:
+        index = bisect.bisect_right(times, job['start_us']) - 1
+        job['frame'] = marks[index][1] if index >= 0 else None
+
+
 def read_live(path):
     capture = {'metadata': {}, 'clocks': [], 'batches': [], 'status': [],
                'cpu_intervals': [], 'cpu_work_dropped': 0,
-               'native_scenes': [], 'native_scene_dropped': 0}
+               'native_scenes': [], 'native_scene_dropped': 0,
+               'pa_config': None, 'pa_chunks': [], 'pa_jobs': [], 'pa_bookmarks': []}
     pending = None
     for tag, data in records(path.read_bytes(), b'RZLV'):
         if pending is not None and tag != b'DATA':
@@ -132,9 +242,10 @@ def read_live(path):
         elif tag == b'CLCK':
             if len(data) != 32:
                 raise ValueError('Invalid clock anchor')
-            before, ticks, after, frequency, _ = struct.unpack('<QQQII', data)
+            before, ticks, after, frequency, heartbeat = struct.unpack('<QQQII', data)
             capture['clocks'].append({'kernel_before_us': before, 'pa_ticks': ticks,
-                                     'kernel_after_us': after, 'frequency_mhz': frequency})
+                                     'kernel_after_us': after, 'frequency_mhz': frequency,
+                                     'heartbeat': heartbeat})
         elif tag == b'CPUX':
             if len(data) != 24:
                 raise ValueError('Invalid CPUX processing interval size')
@@ -186,12 +297,35 @@ def read_live(path):
                 raise ValueError('Unexpected live data record')
             pending['entries'] = entries(data, pending['entry_count'])
             pending = None
+        elif tag == b'PACF':
+            if len(data) != 32:
+                raise ValueError('Invalid PA trace configuration')
+            fields = ('group', 'mode', 'selects_a', 'selects_b', 'period', 'trace_bytes', 'pa_mhz', 'gpu_mhz')
+            capture['pa_config'] = dict(zip(fields, struct.unpack('<8I', data)))
+        elif tag == b'PATR':
+            if len(data) < 32 or (len(data) - 32) % PA_BLOCK:
+                raise ValueError('Invalid PA trace record')
+            sequence, heartbeat, segment, status, offset, size, gpu_mhz, _ = struct.unpack_from('<8I', data)
+            if size != len(data) - 32:
+                raise ValueError('PA trace record size mismatch')
+            batch = dict(sequence=sequence, heartbeat=heartbeat, status='0x00000000', pa_status=f'0x{status:08x}',
+                         segment=segment, offset=offset, bytes=size, gpu_mhz=gpu_mhz, group=None,
+                         entry_count=0, overflow_count=0, start_us=0, end_us=0, entries=[])
+            capture['batches'].append(batch)
+            capture['pa_chunks'].append((batch, data[32:]))
         elif tag in (b'STAT', b'STOP', b'MODE'):
             if len(data) != 4:
                 raise ValueError('Invalid status record')
             capture['status'].append({'operation': tag.decode(), 'value': f'0x{struct.unpack("<I", data)[0]:08x}'})
     if pending is not None:
         raise ValueError('Capture ends before batch data')
+    if capture['pa_chunks']:
+        if not capture['pa_config']:
+            raise ValueError('PA trace without its configuration')
+        for batch, _ in capture['pa_chunks']:
+            batch['group'] = capture['pa_config']['group']
+        decode_pa(capture)
+    del capture['pa_chunks']
     for span in capture['cpu_intervals']:
         span['scope'] = cpu_processing_scope(capture)
     return capture
@@ -243,11 +377,14 @@ def own_cpu_intervals(capture, pid=None):
 
 
 def own_jobs(capture, pid=None):
+    own = int(capture['metadata']['pid'], 0)
     if pid is None:
-        pid = int(capture['metadata']['pid'], 0)
-    return [entry for batch in capture['batches'] for entry in batch['entries']
+        pid = own
+    jobs = [entry for batch in capture['batches'] for entry in batch['entries']
             if entry['entry_type'] == 0 and entry.get('pid') == pid
             and entry.get('stage') in ('TA', '3D')]
+    # The PA's counters carry no process: all GPU work counts as the recorder's.
+    return jobs + [job for job in capture.get('pa_jobs', []) if pid == own and job['stage'] in ('TA', '3D')]
 
 
 def summarize(capture, pid=None):
@@ -260,9 +397,15 @@ def summarize(capture, pid=None):
     errors = [batch['status'] for batch in capture['batches'] if int(batch['status'], 16) & 0x80000000]
     summary = {'batches': len(capture['batches']), 'jobs': len(jobs),
                'overflow_entries': sum(batch['overflow_count'] for batch in capture['batches']),
-               'frames': len({job['frame'] for job in jobs}), 'stages': {},
+               'frames': len({job['frame'] for job in jobs if job.get('frame') is not None}), 'stages': {},
                'collection_state': collection_state, 'batch_errors': sorted(set(errors)),
                'duration_scope': 'observed native jobs, union across GPU cores'}
+    if capture.get('pa_config'):
+        summary.update(source='PA busy counters', attribution='none: every process\'s GPU work',
+                       frame_basis='heartbeats completed when the job started (CLCK anchors)',
+                       trace_segments=len({batch['segment'] for batch in capture['batches']}),
+                       truncated_jobs=sum(1 for job in jobs if job.get('truncated')),
+                       bookmarks=len(capture['pa_bookmarks']))
     summary['trace_complete'] = stopped and not failed_start and not errors and not summary['overflow_entries']
     for stage in ('TA', '3D'):
         selected = [job for job in jobs if job['stage'] == stage]

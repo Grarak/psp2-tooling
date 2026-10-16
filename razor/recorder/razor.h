@@ -1,19 +1,35 @@
 #pragma once
-// Sony Razor GPU recording for a GXM app on a DevKit: live GPU metrics (.rzlv, razor/rzlv.py)
-// and frame snapshots (.sgx, razor/sgx_capture.py). Add razor.cpp to the app and link
-// SceRazorCapture_stub_weak, SceRazorHud_stub_weak, ScePamgr_stub, SceSysmodule_stub and
-// SceGxm_stub. With no live= or capture= option the hooks make no Razor calls.
+// Sony Razor GPU recording for a GXM app on a DevKit or a retail Vita: live GPU metrics (.rzlv,
+// razor/rzlv.py) and frame snapshots (.sgx, razor/sgx_capture.py). Add razor.cpp to the app and
+// link SceRazorCapture_stub_weak, ScePamgr_stub, ScePower_stub, SceGxm_stub and
+// SceGpuEs4User_stub, which VitaSDK lacks: build it from SceGpuEs4User.yml beside this file
+// (vita-libs-gen SceGpuEs4User.yml OUT && make -C OUT). With no live= or capture= option the
+// hooks make no Razor calls.
 //
-// Live metrics need LIVE=1 in host0:/hud_settings.ini (missing: STAT 0x8008c008; another
-// mode: 0x8008c002, and the collector never starts).
+// Like the HUD, live metrics first switch the SGX's own performance counters on
+// (SGXGetMiscInfo, SET_HWPERF_STATUS) with the group's selects: the PA samples those counters,
+// and without that every counter in the trace reads zero on hardware.
+//
+// Live metrics drive the Performance Analyzer through pamgr the way Sony's Razor HUD does,
+// without the HUD: the PA samples into the recorder's buffer for the whole window, which is
+// written out raw only when the window ends, and razor/rzlv.py turns the samples into
+// per-core TA/3D busy intervals offline. The HUD's 40 us sampling makes up to 4 MB/s, so the
+// buffer bounds the window (group 1: about 2 s per 8 MiB). pamgr is resident on a
+// DevKit; a retail Vita needs retail-cp, which loads it and accepts the recorder's buffer.
+//
+// Snapshots load librazorcapture_es4.suprx from ur0:data/; copy it there from DevKit firmware's
+// vs0:sys/external. A retail Vita rejects that encrypted SELF (0x800f0516): give it an fSELF of
+// the decrypted ELF instead (vita-make-fself -c librazorcapture_es4.elf librazorcapture_es4.suprx).
 //
 // Options, comma-separated:
 //   live=PATH        .rzlv output; enables live metrics (host0:/gpu.rzlv)
-//   group=N          metrics group: 0 parameter buffer, 1 USSE/texture activity (default),
-//                    2 primitive/vertex/pixel counts, 3 TA/ISP memory bytes
+//   group=N          the PA counter selects of the HUD's metrics group: 0 parameter buffer,
+//                    1 USSE/texture activity (default), 2 primitive/vertex/pixel counts,
+//                    3 TA/ISP memory bytes; every group carries the TA/3D busy counters
 //   start=N          start after this many frame() calls (default 120)
-//   frames=N         collections to record (default 120; 0: until stop())
-//   hide-hud         hide Sony's HUD overlay; collection continues
+//   frames=N         frames to trace (default 120; 0: until stop()); a full buffer ends the
+//                    window early
+//   trace-mib=N      trace buffer in MiB, physically contiguous (default 8, at most 64)
 //   scenes           scene records from scene_begin()/scene_draw()
 //   cpu              CPU wall spans from begin_cpu_work()/end_cpu_work() (one thread only)
 //   capture=PATH     .sgx snapshot of the frame after capture-frame=N (default 120); a

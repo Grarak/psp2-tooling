@@ -1,12 +1,13 @@
 #include "razor.h"
 #include <psp2/gxm.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/modulemgr.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/pamgr.h>
+#include <psp2/power.h>
 #include <psp2/razor_capture.h>
-#include <psp2/razor_hud.h>
-#include <psp2/sysmodule.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -23,16 +24,76 @@
 extern "C" {
 int sceGxmAddRazorGpuCaptureBuffer(void* base, uint32_t size);
 int sceGxmRemoveRazorGpuCaptureBuffer(void* base);
-int sceRazorHudReloadSettings(void);
-int sceRazorHudSetDisplayEnabled(SceBool displayEnabled);
-uint32_t sceRazorGpuPerfGetMode(void);
 SceBool sceRazorGpuCaptureIsInProgress(void);
+int sceKernelPaRegisterShared(uint32_t first, uint32_t second);
+void* sceGxmGetTopContextInternal(void);
+// libgpu_es4's SGXGetMiscInfo (SceGpuEs4User 0x09BB98B2): VitaSDK has no stub for it, so
+// link the one SceGpuEs4User.yml (beside this file) generates.
+int SGXGetMiscInfo(void* devData, void* miscInfo);
 }
+
+// _sceKernelPaSetupTraceBufferByKey: a physically contiguous buffer the PA writes trace into.
+// pamgr wants base, size and the field after them 128-byte aligned.
+struct SceKernelPaTraceBufferParam {
+  uint32_t flags; // 1 for a GPU trace, as SceRazorHud sets it
+  void* base;
+  uint32_t size, reserved, captureFlags;
+};
+// _sceKernelPaAddGpuTraceByKey, copied into the PA's registers: the mode (+0x1190), the
+// sample period in PA ticks twice (+0x1194) and each GPU core's counter selects (+0x1140,
+// +0x1150).
+struct SceKernelPaGpuTraceParam {
+  uint32_t mode;
+  uint16_t period[2];
+  uint32_t selectsA[4], selectsB[4], reserved[8];
+};
+
+static_assert(sizeof(SceKernelPaTraceBufferParam) == 0x14);
+static_assert(sizeof(SceKernelPaGpuTraceParam) == 0x48);
 
 namespace razor {
 namespace {
-constexpr unsigned BufferBytes = 256u << 10;
-constexpr uint32_t LiveMode = 3;
+// Razor's capture module ships only in DevKit firmware (vs0:sys/external). It is copied to
+// ur0:data/ and loaded from there, as vitaGL does, so the same app runs on retail.
+constexpr const char* CaptureModule = "ur0:data/librazorcapture_es4.suprx";
+// Live metrics drive the Performance Analyzer through pamgr the way SceRazorHud's live start
+// does (its FUN_81007248), without the HUD: the same key, buffer setup and GPU trace. The
+// counter selects of SceRazorHud's four metric groups (its table at 0x8100d5b0); in every
+// group, selectsB bits 24, 25 and 26 are each core's vertex, fragment and firmware busy.
+constexpr uint32_t PaKey[2] = {0x7a207888, 0x7a207777};
+constexpr uint32_t GroupSelects[4][2] = {
+    {0x00000000, 0x07014100}, {0x00000000, 0x07ff2929}, {0x1f000000, 0x070f1f1f}, {0x00000000, 0x07010100}};
+// The PA samples the SGX's performance counters, which are off until the driver gets
+// SGX_MISC_INFO_REQUEST_SET_HWPERF_STATUS (PowerVR's sgxapi_km.h): SceRazorHud sends it
+// (its FUN_810065dc) with each group's eight counter groups and bits, the same table rows
+// (+0x08, +0x28) as the selects above. SceGpuEs4 then sets EUR_CR_PERF_DEBUG_CTRL and each
+// core's EUR_CR_PERF0-3. Without it every counter in the trace is zero.
+struct SgxSetHwPerfStatus {
+  uint32_t request = 3; // SGX_MISC_INFO_REQUEST_SET_HWPERF_STATUS
+  uint32_t reserved = 0;
+  uint32_t status;      // PVRSRV_SGX_HWPERF_STATUS_*: 1 reset counters, 2 graphics on
+  uint32_t group[8], bit[8];
+};
+static_assert(sizeof(SgxSetHwPerfStatus) == 0x4c);
+constexpr uint32_t HwPerfGroup[4][8] = {
+    {3, 3, 0, 0, 0, 0, 0, 0}, {0, 0, 0, 0, 0x64, 0x44, 1, 0}, {0, 0, 0, 0x2c, 0x2c, 0x2c, 0, 0}, {0, 0, 0, 0, 0, 0x36, 0x36, 0}};
+constexpr uint32_t HwPerfBit[4][8] = {{0, 8, 0x1c, 0x1c, 0x1c, 8, 0x12, 0},
+                                      {0x1c, 0x1c, 0x1c, 0x1c, 0, 0, 0, 0},
+                                      {0x1c, 0x1c, 0x1c, 0xf, 0xa, 1, 0x18, 0},
+                                      {0x1c, 0x1c, 0x1c, 0x1c, 0x1c, 0x12, 6, 0}};
+constexpr uint16_t SamplePeriod = 0x3408; // PA ticks: 40 us at 333 MHz
+constexpr uint32_t PaGpuMode = 2;
+// The PA writes into the buffer for the whole window and stops when it is full; the trace is
+// read only afterwards, so the measured frames do no host I/O for it.
+constexpr unsigned TraceSlack = 64u << 10;
+struct ClockRecord {
+  uint32_t tag = 0x4b434c43, bytes = 32; // CLCK
+  uint64_t kernelBefore, paTicks, kernelAfter;
+  uint32_t frequencyMHz, heartbeat;
+};
+
+static_assert(sizeof(ClockRecord) == 40);
+constexpr unsigned MaxClockRecords = 4096;
 struct CpuWorkRecord {
   uint32_t tag = 0x58555043, bytes = 24; // CPUX, then kernel-clock wall interval.
   uint64_t start, end;
@@ -56,24 +117,29 @@ struct SceneRecord {
 static_assert(sizeof(SceneRecord) == 216);
 constexpr unsigned MaxSceneRecords = 64;
 struct State {
-  bool initialized = false, hud = false, live = false, finished = false;
+  bool initialized = false, live = false, finished = false, hwperf = false;
   bool captureTriggered = false, captureBusy = false;
   std::atomic<bool> capture{false};
   const char* capturePath = nullptr;
   const char* livePath = nullptr;
   unsigned captureFrame = 120, liveStartFrame = 120, liveFrames = 120;
-  unsigned frame = 0, group = 1, sequence = 0, index = 0;
-  bool cpuTrace = false, hideHud = false;
+  unsigned frame = 0, group = 1, sequence = 0;
+  bool cpuTrace = false;
   uint32_t cpuDropped = 0;
   std::vector<CpuWorkRecord> cpuWork;
   bool sceneTrace = false;
   uint32_t sceneDropped = 0, sceneOrdinal = 0, activeScene = UINT32_MAX, previousPass = 4;
   std::vector<SceneRecord> scenes;
   SceUID output = -1;
-  void* buffers[2]{};
+  SceUID captureModule = -1;
+  SceUID traceBlock = -1;
+  void* trace = nullptr;
+  int paKey = -1;
+  uint32_t traceBytes = 8u << 20, traceBase = 0;
+  std::vector<ClockRecord> clocks;
 } state;
-// item[,item...]: live=PATH, group=N, start=N, frames=N, hide-hud, scenes, cpu, capture=PATH,
-// capture-frame=N, salvage=PATH (razor.h).
+// item[,item...]: live=PATH, group=N, start=N, frames=N, trace-mib=N, scenes, cpu,
+// capture=PATH, capture-frame=N, salvage=PATH (razor.h).
 struct Options {
   std::vector<std::pair<std::string, std::string>> values;
   std::vector<std::string> flags;
@@ -92,10 +158,10 @@ struct Options {
       const std::string_view name = item.substr(0, equals);
       bool known = false;
 
-      for (const std::string_view k : {"live", "group", "start", "frames", "capture", "capture-frame", "salvage"})
+      for (const std::string_view k : {"live", "group", "start", "frames", "trace-mib", "capture", "capture-frame", "salvage"})
         known |= equals != std::string_view::npos && name == k;
 
-      for (const std::string_view k : {"hide-hud", "scenes", "cpu"})
+      for (const std::string_view k : {"scenes", "cpu"})
         known |= equals == std::string_view::npos && name == k;
 
       if (!known) {
@@ -143,28 +209,12 @@ struct Options {
 };
 const char* error_name(int result) {
   switch (uint32_t(result)) {
-  case 0x8008c000:
-    return "not initialized";
-  case 0x8008c001:
-    return "invalid argument";
-  case 0x8008c002:
-    return "LIVE=1 required in hud_settings.ini";
-  case 0x8008c003:
-    return "live collector not started";
-  case 0x8008c004:
-    return "live collector already started";
-  case 0x8008c005:
-    return "PA block unavailable";
-  case 0x8008c006:
-    return "PA trace overflow";
-  case 0x8008c007:
-    return "buffer not 8-byte aligned";
-  case 0x8008c008:
-    return "hud_settings.ini not found";
-  case 0x8008c009:
-    return "invalid pointer";
+  case 0x80020005:
+    return "kernel PA invalid argument";
   case 0x80021102:
     return "kernel PA invalid key";
+  case 0x80027205:
+    return "kernel PA not claimed";
   default:
     return "native API error";
   }
@@ -229,20 +279,37 @@ void flush_scene_work() {
   }
 }
 
+// Kept in memory until the window ends. PA frequency is in MHz: the HUD divides raw ticks
+// by it to obtain us. Preserve both clock domains and the syscall bracket, never assume
+// their epoch matches. A PA block that does not count returns zero ticks.
+// SceRazorHud's status 3 (reset the counters, graphics on) with the group's selects, or 0.
+int set_hwperf(bool on) {
+  SgxSetHwPerfStatus info{};
+  info.status = on ? 3 : 0;
+
+  for (unsigned n = 0; on && n < 8; ++n) {
+    info.group[n] = HwPerfGroup[state.group][n];
+    info.bit[n] = HwPerfBit[state.group][n];
+  }
+
+  return SGXGetMiscInfo(sceGxmGetTopContextInternal(), &info);
+}
+
 void clock_anchor() {
-  // PA frequency is in MHz: the HUD divides raw ticks by it to obtain us.
-  // Preserve both clock domains and the syscall bracket, never assume their
-  // epoch matches. A PA block that does not count returns zero ticks.
-  struct Clock {
-    uint64_t kernelBefore, paTicks, kernelAfter;
-    uint32_t frequencyMHz, reserved;
-  } clock{};
+  if (state.clocks.size() == MaxClockRecords)
+    return;
+
+  ClockRecord clock{};
   clock.frequencyMHz = sceKernelPaGetTimebaseFrequency();
   clock.kernelBefore = sceKernelGetSystemTimeWide();
   clock.paTicks = sceKernelPaGetTimebaseValue();
   clock.kernelAfter = sceKernelGetSystemTimeWide();
-  static_assert(sizeof(Clock) == 32);
-  record("CLCK", &clock, sizeof(clock));
+  clock.heartbeat = state.frame;
+  state.clocks.push_back(clock);
+}
+
+uint32_t trace_written() {
+  return sceKernelPaGetWritePointer() - state.traceBase;
 }
 
 bool begin_live() {
@@ -260,119 +327,138 @@ bool begin_live() {
   char metadata[1024];
   const int length =
       std::snprintf(metadata, sizeof(metadata),
-                    "pid=0x%08x\ngroup=%u\nsource=Sony Razor GPU Live Metrics\nclock=PA microseconds; CLCK anchors kernel microseconds\ncollection=asynchronous\ncpu_processing=%s\ncpu_scope=%s\nhud_display=%s\nscene_records=%s\nscene_frame=completed heartbeats at scene begin; ordinal is not assumed to equal PA sceneId\nscene_clock=kernel microseconds at scene begin\n",
+                    "pid=0x%08x\ngroup=%u\nsource=Performance Analyzer GPU trace (pamgr)\nclock=PA ticks; CLCK anchors kernel microseconds at each heartbeat\ncollection=in device memory; written after the window\ncpu_processing=%s\ncpu_scope=%s\nscene_records=%s\nscene_frame=completed heartbeats at scene begin; ordinal is not assumed to equal PA sceneId\nscene_clock=kernel microseconds at scene begin\n",
                     unsigned(sceKernelGetProcessId()), state.group, state.cpuTrace ? "kernel microseconds; CPUX native game/render owner pre-presentation wall intervals" : "disabled",
-                    state.cpuTrace ? "native-owner-prepresent" : "disabled", state.hideHud ? "disabled" : "default", state.sceneTrace ? "application draws; excludes driver/HUD internal work" : "disabled");
+                    state.cpuTrace ? "native-owner-prepresent" : "disabled", state.sceneTrace ? "application draws; excludes driver internal work" : "disabled");
   record("META", metadata, unsigned(length));
-  int result = sceRazorHudReloadSettings();
-  report(result, "reload HUD settings");
 
-  if (result < 0) {
-    record("STAT", &result, sizeof(result));
-    return false;
+  // The PA writes the trace by physical address, and the CPU reads it back uncached.
+  state.traceBlock = sceKernelAllocMemBlock("razor_pa_trace", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, state.traceBytes, nullptr);
+  int result = state.traceBlock;
+
+  if (result >= 0)
+    result = sceKernelGetMemBlockBase(state.traceBlock, &state.trace);
+
+  report(result, "allocate the PA trace buffer");
+
+  if (result >= 0) {
+    result = sceKernelPaRegisterShared(PaKey[0], PaKey[1]);
+    report(result, "register with pamgr");
   }
 
-  if (state.hideHud) {
-    // Display visibility and LIVE metrics are separate Sony APIs. Settings
-    // reload restores display defaults, so hide only after that reload.
-    result = sceRazorHudSetDisplayEnabled(SCE_FALSE);
-    report(result, "hide live HUD display");
+  if (result >= 0) {
+    state.paKey = result;
 
-    if (result < 0) {
-      record("STAT", &result, sizeof(result));
-      return false;
+    if (sceKernelPaGetTraceBufferStatus() & 1)
+      sceKernelPaStopByKey(state.paKey);
+
+    SceKernelPaGpuTraceParam gpu{PaGpuMode, {SamplePeriod, SamplePeriod}, {}, {}, {}};
+
+    for (unsigned core = 0; core < 4; ++core) {
+      gpu.selectsA[core] = GroupSelects[state.group][0];
+      gpu.selectsB[core] = GroupSelects[state.group][1];
+    }
+
+    // The SGX's counters first: the PA only samples them.
+    const int hwperf = set_hwperf(true);
+    state.hwperf = hwperf == 0;
+    std::fprintf(stderr, "razor: switch the SGX performance counters on = %d (PVRSRV_ERROR, 0: ok)\n", hwperf);
+    // SceRazorHud's order: the buffer, the GPU trace, both bookmark channels, then start.
+    const SceKernelPaTraceBufferParam buffer{1, state.trace, state.traceBytes, 0, 0};
+    result = _sceKernelPaSetupTraceBufferByKey(state.paKey, &buffer);
+    report(result, "set up the PA trace buffer");
+    // Until the PA writes, the write pointer is the buffer's physical base.
+    state.traceBase = sceKernelPaGetWritePointer();
+
+    if (result >= 0) {
+      result = _sceKernelPaAddGpuTraceByKey(state.paKey, &gpu);
+      report(result, "add the GPU trace");
+    }
+
+    for (unsigned fifo = 0; result >= 0 && fifo < 2; ++fifo)
+      result = sceKernelPaSetBookmarkChannelEnableByKey(state.paKey, fifo, 0xffff);
+
+    if (result >= 0) {
+      struct Config {
+        uint32_t group, mode, selectsA, selectsB, period, traceBytes, paMHz, gpuMHz;
+      } config{state.group, PaGpuMode, gpu.selectsA[0], gpu.selectsB[0], SamplePeriod, state.traceBytes,
+               sceKernelPaGetTimebaseFrequency(), uint32_t(scePowerGetGpuClockFrequency())};
+      static_assert(sizeof(Config) == 32);
+      record("PACF", &config, sizeof(config));
+      result = sceKernelPaStartByKey(state.paKey);
     }
   }
 
-  const uint32_t mode = sceRazorGpuPerfGetMode();
-  record("MODE", &mode, sizeof(mode));
-  std::fprintf(stderr, "razor: native performance mode %u (live requires 3)\n", mode);
-  result = sceRazorGpuLiveSetMetricsGroup(state.group);
-  report(result, "select live metrics group");
-
-  if (result >= 0 && mode == LiveMode)
-    result = sceRazorGpuLiveStart();
-  else if (result >= 0)
-    result = int(0x8008c002);
-
-  report(result, "start live GPU collection");
+  report(result, "start the PA GPU trace");
   record("STAT", &result, sizeof(result));
-  clock_anchor();
 
   if (result < 0)
     return false;
 
+  state.clocks.reserve(state.liveFrames ? state.liveFrames + 2 : MaxClockRecords);
+  clock_anchor();
   state.live = true;
-
-  for (auto& buffer : state.buffers) {
-    buffer = memalign(8, BufferBytes);
-
-    if (!buffer) {
-      report(int(0x8008c009), "allocate live result buffer");
-      return false;
-    }
-  }
-
   return true;
 }
 
-void collect() {
-  SceRazorGpuLiveResultInfo results{};
-  const int result = sceRazorGpuLiveSetBuffer(state.buffers[state.index], BufferBytes, &results);
-  state.index ^= 1;
-
-  // The pointer belongs to the previous buffer. Walk entry sizes within the
-  // reported capacity before writing; never serialize a target-side pointer.
-  unsigned bytes = 0;
-
-  if (results.result_data) {
-    for (unsigned i = 0; i < results.entry_count; ++i) {
-      if (bytes > results.buffer_size || results.buffer_size - bytes < sizeof(SceRazorGpuLiveEntryHeader)) {
-        report(int(0x8008c001), "truncated live result header");
-        return;
-      }
-
-      const auto* entry = reinterpret_cast<const SceRazorGpuLiveEntryHeader*>(static_cast<const char*>(results.result_data) + bytes);
-
-      if (entry->entry_size < sizeof(*entry) || entry->entry_size > results.buffer_size - bytes) {
-        report(int(0x8008c001), "invalid live result size");
-        return;
-      }
-
-      bytes += entry->entry_size;
-    }
-  } else if (results.entry_count) {
-    report(int(0x8008c009), "missing live result data");
-    return;
-  }
-
-  struct Batch {
-    uint32_t sequence, heartbeat, status, entryCount, overflowCount, bytes, group, reserved;
-    uint64_t start, end;
-  } batch{state.sequence++, state.frame, uint32_t(result), results.entry_count, results.overflow_count, bytes, results.metric_group, 0, results.start_time, results.end_time};
-  static_assert(sizeof(Batch) == 48);
+// One heartbeat: an anchor, and whether the window goes on (frames left, buffer not full).
+bool collect() {
   clock_anchor();
-  record("BATS", &batch, sizeof(batch));
+  ++state.sequence;
+  return (!state.liveFrames || state.sequence < state.liveFrames) && trace_written() + TraceSlack < state.traceBytes &&
+         !(sceKernelPaGetTraceBufferStatus() & 4);
+}
 
-  if (bytes)
-    record("DATA", results.result_data, bytes);
+// The whole trace, raw, as one PATR record: its header, then the 128-byte blocks.
+void write_trace(int stopped) {
+  struct Header {
+    uint32_t sequence, heartbeat, segment, status, offset, bytes, gpuMHz, firstHeartbeat;
+  } header{state.sequence, state.frame, 0, sceKernelPaGetTraceBufferStatus(), 0, 0,
+           uint32_t(scePowerGetGpuClockFrequency()), state.liveStartFrame};
+  static_assert(sizeof(Header) == 32);
+  const uint32_t written = trace_written();
 
-  if (result < 0)
-    report(result, "collect live GPU results");
+  if (stopped >= 0 && written <= state.traceBytes)
+    header.bytes = written & ~127u;
+  else if (stopped >= 0)
+    report(int(0x80020005), "PA write pointer outside the trace buffer");
 
-  if (results.overflow_count)
-    std::fprintf(stderr, "razor: dropped %u live entries at heartbeat %u\n", unsigned(results.overflow_count), state.frame);
+  const uint32_t bytes = sizeof(header) + header.bytes;
+  if (write_bytes("PATR", 4) && write_bytes(&bytes, 4) && write_bytes(&header, sizeof(header)) && header.bytes)
+    write_bytes(state.trace, header.bytes);
 }
 
 void close_live() {
   if (state.live) {
+    const int result = sceKernelPaStopByKey(state.paKey);
+    report(result, "stop the PA GPU trace");
+    clock_anchor();
     flush_cpu_work();
     flush_scene_work();
-    collect();
-    const int result = sceRazorGpuLiveStop();
-    report(result, "stop live GPU collection");
+
+    if (!state.clocks.empty())
+      write_bytes(state.clocks.data(), unsigned(state.clocks.size() * sizeof(ClockRecord)));
+
+    write_trace(result);
     record("STOP", &result, sizeof(result));
     state.live = false;
+  }
+
+  if (state.hwperf) {
+    std::fprintf(stderr, "razor: switch the SGX performance counters off = %d (PVRSRV_ERROR, 0: ok)\n", set_hwperf(false));
+    state.hwperf = false;
+  }
+
+  if (state.paKey >= 0) {
+    sceKernelPaRemoveGpuTraceByKey(state.paKey);
+    report(sceKernelPaUnregister(state.paKey), "unregister from pamgr");
+    state.paKey = -1;
+  }
+
+  if (state.traceBlock >= 0) {
+    sceKernelFreeMemBlock(state.traceBlock);
+    state.traceBlock = -1;
+    state.trace = nullptr;
   }
 
   if (state.output >= 0) {
@@ -380,11 +466,7 @@ void close_live() {
     state.output = -1;
   }
 
-  for (auto& buffer : state.buffers) {
-    std::free(buffer);
-    buffer = nullptr;
-  }
-
+  std::vector<ClockRecord>().swap(state.clocks);
   state.finished = true;
 }
 } // namespace
@@ -398,7 +480,6 @@ void initialize(const char* text) noexcept {
   state.capturePath = options.option("capture");
   state.livePath = options.option("live");
   state.cpuTrace = state.livePath && options.flag("cpu");
-  state.hideHud = state.livePath && options.flag("hide-hud");
   state.sceneTrace = state.livePath && options.flag("scenes");
 
   if (state.cpuTrace)
@@ -416,19 +497,18 @@ void initialize(const char* text) noexcept {
   state.liveStartFrame = options.number("start", 120, UINT32_MAX - 1);
   state.liveFrames = options.number("frames", 120, UINT32_MAX - 1);
   state.group = options.number("group", 1, 3);
+  state.traceBytes = options.number("trace-mib", 8, 64) << 20;
+
+  if (!state.traceBytes)
+    state.traceBytes = 8u << 20;
   if (state.capturePath || salvage) {
-    const int result = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_CAPTURE);
-    report(result, "load capture module before GXM");
+    const SceUID result = sceKernelLoadStartModule(CaptureModule, 0, nullptr, 0, nullptr, nullptr);
+    report(result, "load ur0:data/librazorcapture_es4.suprx before GXM");
+    state.captureModule = result;
     state.capture.store(result >= 0, std::memory_order_relaxed);
 
     if (result >= 0 && salvage)
       sceRazorGpuCaptureEnableSalvage(salvage);
-  }
-
-  if (state.livePath) {
-    const int result = sceSysmoduleLoadModule(SCE_SYSMODULE_RAZOR_HUD);
-    report(result, "load HUD module before GXM");
-    state.hud = result >= 0;
   }
 }
 
@@ -542,7 +622,7 @@ void frame() noexcept {
     }
   }
 
-  if (!state.hud || state.finished || state.frame < state.liveStartFrame)
+  if (!state.livePath || state.finished || state.frame < state.liveStartFrame)
     return;
 
   if (!state.live && !begin_live()) {
@@ -552,9 +632,8 @@ void frame() noexcept {
 
   flush_cpu_work();
   flush_scene_work();
-  collect();
 
-  if (state.output < 0 || (state.liveFrames && state.sequence >= state.liveFrames))
+  if (!collect() || state.output < 0)
     close_live();
 }
 
@@ -566,11 +645,10 @@ void stop() noexcept {
 void terminate() noexcept {
   stop();
 
-  if (state.hud)
-    report(sceSysmoduleUnloadModule(SCE_SYSMODULE_RAZOR_HUD), "unload HUD after GXM");
-
   if (state.capture.exchange(false, std::memory_order_relaxed))
-    report(sceSysmoduleUnloadModule(SCE_SYSMODULE_RAZOR_CAPTURE), "unload capture after GXM");
+    report(sceKernelStopUnloadModule(state.captureModule, 0, nullptr, 0, nullptr, nullptr),
+           "unload capture after GXM");
+  state.captureModule = -1;
 
   std::vector<CpuWorkRecord>().swap(state.cpuWork);
   std::vector<SceneRecord>().swap(state.scenes);
@@ -580,11 +658,10 @@ void terminate() noexcept {
   state.previousPass = 4;
   state.cpuTrace = false;
   state.cpuDropped = 0;
-  state.hud = false;
   state.initialized = false;
   state.finished = false;
   state.captureTriggered = state.captureBusy = false;
-  state.frame = state.sequence = state.index = 0;
+  state.frame = state.sequence = 0;
 }
 
 void register_buffer(void* base, std::size_t bytes) noexcept {

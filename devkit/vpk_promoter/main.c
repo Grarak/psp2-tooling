@@ -67,6 +67,7 @@ int main(void)
 {
     const char *package = "ux0:data/vpk-promoter-package";
     sceClibPrintf("[vpk-promoter] copying package\n");
+    sceIoMkdir("ux0:data", 0777); /* a freshly formatted card has none */
     int result = copy_tree("host0:/package", package);
     sceClibPrintf("[vpk-promoter] copy: 0x%08X\n", result);
     if (result < 0)

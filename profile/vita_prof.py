@@ -56,7 +56,10 @@ DOF_SECT_OPTDESC, DOF_SECT_INTTAB = 14, 19
 DOF_SECF_LOAD = 1
 DOF_SECIDX_NONE = 0xFFFFFFFF
 DTRACEACT_DIFEXPR, DTRACEACT_USTACK = 1, 0x101
-DTRACEOPT_BUFSIZE, DTRACEOPT_BUFPOLICY = 0, 1
+DTRACEOPT_BUFSIZE, DTRACEOPT_BUFPOLICY, DTRACEOPT_DYNVARSIZE = 0, 1, 2
+# The profile actions use no dynamic variables, but dtracep reserves the 1-MiB default for
+# them; on a retail console its whole heap is 4 MiB (the DevKit's is 16).
+DYNVARSIZE = 8 * 1024
 DTRACEOPT_BUFPOLICY_SWITCH = 2
 DIF_OP_AND, DIF_OP_MOV, DIF_OP_CMP, DIF_OP_BA, DIF_OP_BE, DIF_OP_BNE, DIF_OP_BGEU, DIF_OP_BLU = \
     3, 14, 15, 17, 18, 19, 23, 25
@@ -194,7 +197,8 @@ def profile_dof(hz, pid, bufsize, stack_depth=0, registers=False, stack_bytes=0)
     dof.add(DOF_SECT_OPTDESC, 8, 16,
             struct.pack('<IIQ', DTRACEOPT_BUFSIZE, DOF_SECIDX_NONE, bufsize)
             + struct.pack('<IIQ', DTRACEOPT_BUFPOLICY, DOF_SECIDX_NONE,
-                          DTRACEOPT_BUFPOLICY_SWITCH))
+                          DTRACEOPT_BUFPOLICY_SWITCH)
+            + struct.pack('<IIQ', DTRACEOPT_DYNVARSIZE, DOF_SECIDX_NONE, DYNVARSIZE))
     return dof.image()
 
 
@@ -324,7 +328,9 @@ class Dtracep:
         return handle
 
     def close(self):
-        return struct.unpack_from('<i', self.request(CMD_CLOSE), 0x10)[0]
+        # dtracep's close handler (deci4p_dtracep FUN_81002924) refuses a request with no
+        # body (0x40002) and closes the handle in the tag only when 4 more bytes follow.
+        return struct.unpack_from('<i', self.request(CMD_CLOSE, bytes(4)), 0x10)[0]
 
     def ioctl(self, n, arg=b''):
         """A fixed-size ioctl: returns (rv, the argument as the kernel left it)."""

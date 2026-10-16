@@ -21,6 +21,14 @@
 #   RUN="T=CMD;.."   shell commands T seconds after each launch, in the background, with $SOCK
 #                    (the control socket), $DECI_LOG, $LAUNCH_DIR and $TOOLS set (profilers)
 #
+#   RETAIL=1         a retail Vita with Enso, taiHEN and the retail Target Manager port
+#                    (retail-cp/): no CP board, so power goes through the
+#                    retail-cp plugin's Syscon reset ("power reset" on the control socket). A
+#                    Vita already up is reset for a fresh boot (NORESET=1 keeps it as it is),
+#                    a forced stop resets it, and the session leaves it running. Boot it and
+#                    plug in its USB port first. The console is the TTY text deci4p_host.py
+#                    receives over TTYP (tty.log)
+#
 # Ctrl-C (or killing the PID in OUT/session.pid) ends the launch and powers the DevKit off.
 set -u
 TOOLS=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +40,9 @@ OUT=$(cd "$OUT" && pwd)
 # AF_UNIX paths are limited to 108 bytes.
 SOCK=${XDG_RUNTIME_DIR:-/tmp}/psp2-session-$$.sock
 DECI_LOG=$OUT/deci4p.log
+# What console.log is made from: the CP's mini-USB console, or on retail the TTYP channels.
+CONSOLE_SRC=$OUT/cp-console.log
+[ -n "${RETAIL:-}" ] && CONSOLE_SRC=$OUT/tty.log
 CON= STAMP= DECI=
 jobs_=()
 echo $$ > "$OUT/session.pid"
@@ -45,7 +56,28 @@ down() {
     wait $DECI $CON 2>/dev/null
     DECI= CON= STAMP=
 }
+usb_wait() { # usb_wait present|gone TENTHS
+    for i in $(seq 1 "$2"); do
+        if lsusb -d 054c:04cd > /dev/null; then [ "$1" = present ] && return 0
+        else [ "$1" = gone ] && return 0; fi
+        sleep 0.1
+    done
+    return 1
+}
+retail_reset() {
+    # retail-cp takes power words as TTYP7 input and asks Syscon for a cold reset: the Vita
+    # drops off USB and comes back. Nothing else may hold its port meanwhile.
+    step "retail: Syscon cold reset"
+    # All of its output: the console reads DfMgr's replay to the end after "power: on".
+    timeout --foreground 240 python3 -u "$TOOLS/devkit/devkit_console.py" --retail --log "$OUT/reset.log" \
+        --power reset --wait off --wait on --timeout 200 > "$OUT/reset.out" 2>&1
+    grep -q 'power: on after' "$OUT/reset.out" || { step "retail: no reset (is retail-cp loaded?)"; return 1; }
+}
 off() {
+    if [ -n "${RETAIL:-}" ]; then
+        step "retail: the Vita stays on"
+        return
+    fi
     # The Vita's shutdown waits until every DECI4p unit has disconnected: a fresh link that
     # ends with the power-off lets it through.
     local link=
@@ -64,6 +96,13 @@ force_off() {
     # A process stopped in an assert can hold the shutdown: kill it first.
     [ -n "${current:-}" ] && input "kill $current" > /dev/null
     sleep 1
+    if [ -n "${RETAIL:-}" ]; then
+        # The software power cycle: whatever hangs, short of the kernel or the USB link.
+        input "power reset" > /dev/null
+        usb_wait gone 300 || step "retail: the Vita did not reset"
+        down
+        return
+    fi
     down
     console 30 --power force-off --wait off --timeout 10
     console 15 --state --timeout 5 | grep -q 'state off' || off
@@ -79,15 +118,21 @@ trap abort INT TERM
 
 boot() {
     rm -f "$SOCK"
-    step power up
-    # A cycle is refused (0x2007) when the Vita is off already: then power it on.
-    console 20 --power cycle --timeout 5 | grep -q accepted || { sleep 3; console 20 --power on --timeout 5; }
-    for i in $(seq 1 50); do lsusb -d 054c:04cd > /dev/null || break; sleep 0.2; done
-    for i in $(seq 1 300); do lsusb -d 054c:04cd > /dev/null && break; sleep 0.2; done
-    lsusb -d 054c:04cd > /dev/null || { step "the Vita's USB (054c:04cd) did not appear"; off; return 1; }
-    python3 "$TOOLS/devkit/devkit_console.py" --log "$OUT/cp-console.log" --follow --timeout 86400 > /dev/null 2>&1 &
-    CON=$!
-    tail --pid=$$ -n +1 -F "$OUT/cp-console.log" 2>/dev/null |
+    if [ -n "${RETAIL:-}" ]; then
+        step "retail: waiting for the Vita's USB (054c:04cd)"
+        usb_wait present 1200 || { step "the Vita's USB (054c:04cd) did not appear"; return 1; }
+        [ -n "${NORESET:-}" ] || retail_reset || return 1
+    else
+        step power up
+        # A cycle is refused (0x2007) when the Vita is off already: then power it on.
+        console 20 --power cycle --timeout 5 | grep -q accepted || { sleep 3; console 20 --power on --timeout 5; }
+        for i in $(seq 1 50); do lsusb -d 054c:04cd > /dev/null || break; sleep 0.2; done
+        for i in $(seq 1 300); do lsusb -d 054c:04cd > /dev/null && break; sleep 0.2; done
+        lsusb -d 054c:04cd > /dev/null || { step "the Vita's USB (054c:04cd) did not appear"; off; return 1; }
+        python3 "$TOOLS/devkit/devkit_console.py" --log "$OUT/cp-console.log" --follow --timeout 86400 > /dev/null 2>&1 &
+        CON=$!
+    fi
+    tail --pid=$$ -n +1 -F "$CONSOLE_SRC" 2>/dev/null |
         while IFS= read -r line; do printf '%s %s\n' "$(date +%T.%3N)" "$line"; done > "$OUT/console.log" &
     STAMP=$!
     local launch=()
@@ -96,15 +141,21 @@ boot() {
         --log-name deci4p.log "${launch[@]}" > "$OUT/deci4p.out" 2>&1 &
     DECI=$!
     for i in $(seq 1 300); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    if [ -n "${RETAIL:-}" ]; then
+        # retail-cp loads the Target Manager services once the shell is up (about 15 s after a
+        # reset): launch after LOADP (0x24000) is announced.
+        step "retail: waiting for LOADP"
+        for i in $(seq 1 1200); do grep -aq 'protocol 0x24000' "$OUT/deci4p.log" 2>/dev/null && break; sleep 0.1; done
+    fi
     if [ -n "${INSTALL:-}" ]; then
         step install
         for i in $(seq 1 1500); do
-            grep -aq 'vpk-promoter\] finished' "$OUT/cp-console.log" && break
+            grep -aq 'vpk-promoter\] finished' "$CONSOLE_SRC" && break
             kill -0 $DECI 2>/dev/null || break
             sleep 0.2
         done
-        grep -a 'vpk-promoter\] \(promote\|result\)' "$OUT/cp-console.log"
-        grep -aq 'vpk-promoter\] promote: 0x00000000' "$OUT/cp-console.log" || { step "install failed"; down; off; return 1; }
+        grep -a 'vpk-promoter\] \(promote\|result\)' "$CONSOLE_SRC"
+        grep -aq 'vpk-promoter\] promote: 0x00000000' "$CONSOLE_SRC" || { step "install failed"; down; off; return 1; }
         sleep 3 # the promoter exits after its last line
     fi
 }

@@ -37,6 +37,16 @@ power lock (set by the Vita) and a wrong power state refuse a request; the
 status says which.  The CP's own power events print as [POWER] lines.  A suspend
 needs the PC's answer: the tool sends it as Target Manager does.
 
+On a retail Vita (retail-cp/: the ported dbgusb and the retail-cp plugin) there
+is no CP board.  --retail reads the Vita's own debug port, 054C:04CD, instead: no CP console,
+and the TTY channels as above once it has connected DfMgr itself.  Power goes to retail-cp
+as a line of TTY input on TTYP7, which it hands to Syscon: reset is a cold reset (the
+Vita restarts; unlike a DevKit reset it does not stay off), reboot and off ask ScePower.
+--wait off waits for the Vita to leave USB, --wait on for it to come back, and --state reports
+which of the two it is.
+
+    devkit/devkit_console.py --retail --power reset --wait off --wait on --follow
+
 Target Manager must not hold the device.  Linux needs read/write access to it,
 for example a udev rule:
     SUBSYSTEM=="usb", ATTR{idVendor}=="054c", ATTR{idProduct}=="0432", MODE="0666"
@@ -44,8 +54,10 @@ Requires pyusb (python3-usb).
 """
 
 import argparse
+import queue
 import struct
 import sys
+import threading
 import time
 import zlib
 
@@ -56,6 +68,7 @@ PACKET_MAX = 0x11000
 NODE_PC = 0x4000
 NODE_CP = 0x6000
 NODE_VITA_SDIO = 0xA000
+NODE_VITA_USB = 0xA100
 
 PROTOCOL_DCMP = 0x00000100
 # dfcpm's settings and power service; the Vita's side is TSMP.
@@ -73,6 +86,10 @@ TTY_DATA = 0x1C
 
 USB_VENDOR = 0x054C
 USB_PRODUCT = 0x0432
+RETAIL_PRODUCT = 0x04CD     # the Vita's own debug port (dbgusb)
+# retail-cp reads its power words from this TTY channel's input (TTYP7)
+RETAIL_POWER_TTY = TTY_FAMILY + 7
+RETAIL_POWER = {0x80000000: 'reset', 0x00008000: 'reboot', 0x00000000: 'off'}
 
 # 4/2 power request codes
 POWER_CODES = {
@@ -150,6 +167,13 @@ def dcmp(dst, kind, code, body=b''):
     payload = struct.pack('<BBH', kind, code, 0) + body
     return HEADER.pack(HEADER_MAGIC << 24 | (HEADER.size + len(payload)), NODE_PC, dst,
                        PROTOCOL_DCMP, 0) + payload
+
+
+def tty_input(dst, protocol, text):
+    """TTY input: the output layout, with the text after the 0x1C bytes of fields."""
+    payload = bytes(TTY_LEN) + struct.pack('<I', len(text)) + text
+    return HEADER.pack(HEADER_MAGIC << 24 | (HEADER.size + len(payload)), NODE_PC, dst,
+                       protocol, 0) + payload
 
 
 def tsmp(kind, code, tag, data=b''):
@@ -319,12 +343,112 @@ class Steps:
         self.tick(now)
 
 
+class RetailSteps:
+    """The --power, --state and --wait steps on a retail Vita, through retail-cp.
+
+    A power word goes out as TTYP7 input once DfMgr has the channel open; it has no answer
+    (retail-cp prints the result on the kernel console).  The power state is whether the
+    Vita's debug port is attached.
+    """
+
+    def __init__(self, steps, timeout):
+        self.steps = list(steps)
+        self.timeout = timeout
+        self.write = None
+        self.ready = False          # TTYP7 open
+        self.sent = None            # the last power word, until the Vita leaves USB
+        self.sent_at = 0.0
+        self.started = None
+        self.failed = False
+
+    @property
+    def finished(self):
+        return self.failed or not self.steps
+
+    def attach(self, write):
+        self.write = write
+        self.ready = False
+
+    def lost(self):
+        self.write = None
+        self.ready = False
+        self.sent = None
+        # The Vita left USB: that is the "off" a --wait off is after, however soon it is back.
+        if self.steps and self.steps[0] == ('wait', 'off'):
+            note(f'power: off after {time.monotonic() - (self.started or time.monotonic()):.1f} s')
+            self.steps.pop(0)
+            self.started = None
+        return False
+
+    def tty_open(self):
+        self.ready = True
+        # ttyp flushes a port's input when DfMgr closes it (a 0/1 from a reconnect during
+        # boot): a word sent before that never reached retail-cp, so it goes again.
+        if self.sent and self.steps and self.steps[0] == ('wait', 'off'):
+            self.resend(time.monotonic(), 'TTYP7 reopened')
+
+    def resend(self, now, why):
+        self.write(tty_input(NODE_VITA_USB, RETAIL_POWER_TTY, self.sent.encode() + b'\n'))
+        self.sent_at = now
+        note(f'power: {self.sent} sent again ({why})')
+
+    def answer(self, payload, now):
+        pass
+
+    def fail(self, text):
+        note(f'power: {text}')
+        self.failed = True
+
+    def tick(self, now):
+        while not self.finished:
+            step, arg = self.steps[0]
+            if self.started is None:
+                self.started = now
+            elapsed = now - self.started
+            if step == 'power':
+                if arg not in RETAIL_POWER:
+                    self.fail(f'{power_name(arg)} has no retail equivalent '
+                              f'(retail: {", ".join(RETAIL_POWER.values())})')
+                    return
+                if not self.ready:
+                    break
+                self.write(tty_input(NODE_VITA_USB, RETAIL_POWER_TTY,
+                                     RETAIL_POWER[arg].encode() + b'\n'))
+                self.sent = RETAIL_POWER[arg]
+                self.sent_at = now
+                note(f'power: {RETAIL_POWER[arg]} sent to retail-cp after {elapsed:.1f} s')
+            elif step == 'state':
+                note(f'power: state {"on" if self.write else "off (not on USB)"}')
+            elif step == 'wait':
+                if arg == 'standby':
+                    self.fail('retail cannot tell standby from off')
+                    return
+                if (arg == 'on') != (self.write is not None and self.ready):
+                    # Input that reaches TTYP7 before retail-cp's reader has tty7: open (a
+                    # boot still starting the plugin) is lost: repeat the word until the
+                    # Vita leaves USB. reset acts at once; a second off or reboot is idle.
+                    if arg == 'off' and self.sent and self.ready and now - self.sent_at >= 5.0:
+                        self.resend(now, f'no change in {now - self.sent_at:.0f} s')
+                    break
+                note(f'power: {arg} after {elapsed:.1f} s')
+            self.steps.pop(0)
+            self.started = None
+        if not self.finished and now - self.started > self.timeout:
+            step, arg = self.steps[0]
+            what = {'power': 'TTYP7 to open', 'wait': f'the Vita to be {arg}'}.get(step, step)
+            self.fail(f'gave up after {self.timeout:g} s waiting for {what}')
+
+
 class Console:
     def __init__(self, write, out, log, raw, quiet_cp, power=None):
         self.write = write
         self.out, self.log, self.raw = out, log, raw
         self.quiet_cp = quiet_cp
         self.power = power
+        self.reopen = False
+        self.disconnecting = set()  # retail: units answered a suspend or shutdown status
+        self.replayed = True        # retail: DfMgr answered the last 0/0 with its 2/1s
+        self.connect_at = 0.0
         self.connected = set()
         self.opened = set()
         self.buffer = bytearray()
@@ -367,6 +491,23 @@ class Console:
                 if text:
                     self.emit(f'KTTY{protocol & 3}', text)
 
+    def connect(self, now):
+        """Retail: connect DfMgr, again every 3 s until it replays its protocols.
+
+        A 0/0 that reaches DfMgr while it still sends the backlog of a link nobody read
+        is lost (no "USB: connected", no replay), and DfMgr then waits for another; the
+        backlog's own 2/1s do not count (see dcmp).
+        """
+        if self.replayed and self.connect_at:
+            return
+        if self.connect_at and now - self.connect_at < 3.0:
+            return
+        # Disconnect first, as Target Manager does, so the 0/0 starts a fresh connection.
+        self.replayed = False
+        self.connect_at = now
+        self.write(dcmp(NODE_VITA_USB, 0, 1))
+        self.write(dcmp(NODE_VITA_USB, 0, 0))
+
     def dcmp(self, src, payload):
         if len(payload) < 4:
             return
@@ -397,20 +538,52 @@ class Console:
                 return
             self.emit('POWER', f'{POWER_EVENTS.get(value, "status")} (0x{value:x})\n'.encode())
             return
+        if (kind, code) == (2, 4) and self.reopen and len(payload) >= 8:
+            # Retail: DfMgr's own statuses, with no CP to answer them. Answer as Target
+            # Manager does on the Vita's USB link (as deci4p_host.py does): a suspend (0x8E)
+            # or shutdown (0x8F) waits in DfMgr's sysevent 0x402 for the PC's 0/1 or 0/3,
+            # and after a resume (0x0E/1) or a fresh start (0x0F/1) it waits for a 0/0.
+            subject, state, _, unit = payload[4:8]
+            if (subject, state) in ((0x0F, 1), (0x0E, 1)):
+                # Sent once per DfMgr unit: answer only the first. A second 0/0 while DfMgr
+                # replays leaves it "connecting" for good, deaf to the next client's 0/0.
+                now = time.monotonic()
+                self.disconnecting.clear()
+                if self.replayed or now - self.connect_at >= 3.0:
+                    self.opened.clear()
+                    self.replayed = False
+                    self.connect_at = now
+                    self.write(dcmp(src, 0, 0))
+            elif subject in (0x8E, 0x8F) and state == 0 and unit not in self.disconnecting:
+                self.disconnecting.add(unit)
+                self.write(dcmp(src, 0, 1 if subject == 0x8E else 3))
+                self.emit('POWER', f'{"suspend" if subject == 0x8E else "shutdown"} '
+                                   f'(0x{subject:x}) unit {unit}: disconnected\n'.encode())
+            return
         if (kind, code) != (2, 1) or len(payload) < 0x15:
             return
         protocol = struct.unpack_from('<I', payload, 4)[0]
         status = payload[0x14]
+        # Retail: only the power TTY counts as the replay. A client that left mid-replay
+        # leaves the rest of it queued, and those 2/1s arrive before (and hide the loss of)
+        # this client's 0/0; DfMgr replays the TTY entries first.
+        if not self.reopen or protocol == RETAIL_POWER_TTY:
+            self.replayed = True
         # A Vita's DECI4p manager announcing itself: connect to it, which makes it
         # replay a 2/1 for every protocol it has registered.
         if src >= NODE_VITA_SDIO and src not in self.connected:
             self.connected.add(src)
             self.write(dcmp(src, 0, 0))
-        # A registered TTY channel not yet open: open it.
+        # A registered TTY channel not yet open: open it. Retail's DfMgr keeps an entry's open
+        # bit across this link's 0/1 and a lost transport, while its client waits for a new
+        # 0/4: there, open every TTY channel announced.
         if (protocol & 0xFFFF0000 == TTY_FAMILY and protocol != PROTOCOL_CP_CONSOLE
-                and status & 1 and not status & 2 and (src, protocol) not in self.opened):
+                and status & 1 and (self.reopen or not status & 2)
+                and (src, protocol) not in self.opened):
             self.opened.add((src, protocol))
             self.write(dcmp(src, 0, 4, struct.pack('<I', protocol)))
+            if protocol == RETAIL_POWER_TTY and isinstance(self.power, RetailSteps):
+                self.power.tty_open()
 
 
 class LinkLost(Exception):
@@ -429,13 +602,22 @@ class UsbLink:
         self.ok = self.device is not None
         if not self.ok:
             return
+        # A SET_CONFIGURATION resets the endpoints: retail's dbgusb then never sees the
+        # OUT transfers that follow. Only configure a device that is not configured yet.
         try:
-            if self.device.is_kernel_driver_active(0):
-                self.device.detach_kernel_driver(0)
+            configuration = self.device.get_active_configuration()
+        except usb.core.USBError:
+            self.device.set_configuration()
+            configuration = self.device.get_active_configuration()
+        # DECI4p is the vendor interface: on retail other plugins' USB functions can share the
+        # device ahead of it (udcd_uvc's video interfaces), and their kernel drivers stay bound.
+        interface = (usb.util.find_descriptor(configuration, bInterfaceClass=0xff) or
+                     configuration[(0, 0)])
+        try:
+            if self.device.is_kernel_driver_active(interface.bInterfaceNumber):
+                self.device.detach_kernel_driver(interface.bInterfaceNumber)
         except (NotImplementedError, usb.core.USBError):
             pass
-        self.device.set_configuration()
-        interface = self.device.get_active_configuration()[(0, 0)]
         usb.util.claim_interface(self.device, interface)
 
         def endpoint(direction):
@@ -447,17 +629,35 @@ class UsbLink:
         self.writer = endpoint(usb.util.ENDPOINT_OUT)
         self.name = (f'{vendor:04x}:{product:04x} on bus {self.device.bus} address '
                      f'{self.device.address}')
+        # The IN endpoint is read all the time, as Target Manager does: the Vita's dbgusb
+        # takes no OUT transfer while an IN transfer of its own waits for the PC.
+        self.received = queue.Queue()
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self.read_endpoint, daemon=True)
+        self.thread.start()
 
-    def read(self, timeout):
+    def read_endpoint(self):
         # One USB packet per read: a larger read only completes on a short packet,
         # and a read that times out part-way loses what it had.
+        while not self.stopping.is_set():
+            try:
+                data = self.reader.read(self.reader.wMaxPacketSize, timeout=250)
+            except self.usb.core.USBTimeoutError:
+                continue
+            except self.usb.core.USBError as error:
+                self.received.put(error)
+                return
+            if data:
+                self.received.put(bytes(data))
+
+    def read(self, timeout):
         try:
-            return bytes(self.reader.read(self.reader.wMaxPacketSize,
-                                          timeout=max(1, int(timeout * 1000))))
-        except self.usb.core.USBTimeoutError:
+            data = self.received.get(timeout=timeout)
+        except queue.Empty:
             return b''
-        except self.usb.core.USBError as error:
-            raise LinkLost(error) from None
+        if isinstance(data, Exception):
+            raise LinkLost(data)
+        return data
 
     def write(self, data):
         try:
@@ -466,6 +666,8 @@ class UsbLink:
             raise LinkLost(error) from None
 
     def close(self):
+        self.stopping.set()
+        self.thread.join(1)
         self.usb.util.dispose_resources(self.device)
 
 
@@ -490,6 +692,20 @@ class StateStep(argparse.Action):
         setattr(namespace, self.dest, steps)
 
 
+def drain(console, link):
+    """Retail: read until DfMgr goes quiet before leaving.
+
+    A client that leaves mid-replay leaves the rest of it queued for the next one, and that
+    client's replay then has no TTY entries: TTYP7 never opens and its power word never goes.
+    """
+    end = time.monotonic() + 3.0
+    try:
+        while time.monotonic() < end and (data := link.read(0.5)):
+            console.feed(data)
+    except LinkLost:
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__.split('\n\n')[0],
@@ -501,8 +717,11 @@ def main():
                         help='append the raw DECI4p byte stream here')
     parser.add_argument('--no-cp', action='store_true',
                         help='hide the CP console (the CP\'s own log and the Vita\'s UART1)')
+    parser.add_argument('--retail', action='store_true',
+                        help="a retail Vita with retail-cp (retail-cp/): its own 054C:04CD port, "
+                             'power through retail-cp')
     parser.add_argument('--vid', type=lambda t: int(t, 0), default=USB_VENDOR)
-    parser.add_argument('--pid', type=lambda t: int(t, 0), default=USB_PRODUCT)
+    parser.add_argument('--pid', type=lambda t: int(t, 0))
     parser.add_argument('--power', dest='steps', action='append', metavar='CODE',
                         type=step('power', power_code),
                         help='send dfcpm this power request and wait for its answer '
@@ -523,7 +742,9 @@ def main():
     except ImportError:
         sys.exit('pyusb is missing: apt install python3-usb, or pip install pyusb')
 
-    power = Steps(args.steps, args.timeout) if args.steps else None
+    if args.pid is None:
+        args.pid = RETAIL_PRODUCT if args.retail else USB_PRODUCT
+    power = (RetailSteps if args.retail else Steps)(args.steps, args.timeout) if args.steps else None
     announced = False
     while True:
         try:
@@ -534,7 +755,8 @@ def main():
                     if power.finished and not args.follow:
                         return 1 if power.failed else 0
                 if not announced:
-                    note(f'waiting for {args.vid:04x}:{args.pid:04x} (the DevKit\'s mini-USB port)')
+                    note(f'waiting for {args.vid:04x}:{args.pid:04x} '
+                         f'({"the Vita" if args.retail else "the DevKit"}\'s {"debug" if args.retail else "mini-USB"} port)')
                     announced = True
                 time.sleep(1)
                 continue
@@ -544,11 +766,23 @@ def main():
         console = Console(link.write, sys.stdout, args.log, args.raw, args.no_cp, power)
         if power:
             power.attach(link.write)
+        console.reopen = args.retail
         try:
+            if args.retail:
+                # No CP connects DfMgr here: the host does, and DfMgr replays a 2/1 for every
+                # protocol, which opens the TTY channels.
+                console.connected.add(NODE_VITA_USB)
             while True:
+                if args.retail:
+                    console.connect(time.monotonic())
                 if power:
                     power.tick(time.monotonic())
                     if power.finished and not args.follow:
+                        if args.retail:
+                            drain(console, link)
+                        # Stop the IN reader before leaving: libusb torn down under a read
+                        # in flight asserts (refcnt) and prints after the result line.
+                        link.close()
                         return 1 if power.failed else 0
                 console.feed(link.read(0.1 if power and not power.finished else 0.5))
         except LinkLost as error:

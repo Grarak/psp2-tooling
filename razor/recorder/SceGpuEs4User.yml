@@ -1,0 +1,15 @@
+# libgpu_es4 (module SceGpuEs4User): the one export the recorder uses, which VitaSDK has no
+# stub for. SGXGetMiscInfo is PowerVR's misc-info call; SceRazorHud uses it to switch the
+# SGX hardware performance counters on (SET_HWPERF_STATUS) before a live GPU trace.
+# Build the stub with: vita-libs-gen SceGpuEs4User.yml OUT && make -C OUT
+version: 2
+firmware: 3.60
+modules:
+  SceGpuEs4User:
+    nid: 0x00000000
+    libraries:
+      SceGpuEs4User:
+        kernel: false
+        nid: 0xFAFCA413
+        functions:
+          SGXGetMiscInfo: 0x09BB98B2

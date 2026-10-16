@@ -2,6 +2,7 @@
 # Call stacks of an app's threads through Sony's DTrace: register and stack snapshots for
 # 10 s from 60 s, unwound on the host with the ELF's DWARF CFI, opened in hotspot with
 # callers and callees. Usage: call-stacks.sh HOST0 TITLEID APP.elf
+# Build the app with -g and its SELF with vita-make-fself -na (README, profile/).
 set -e
 T=$(cd "$(dirname "$0")/.." && pwd)
 ELF=$(realpath "$3")
