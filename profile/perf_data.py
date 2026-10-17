@@ -244,7 +244,9 @@ def convert_p2pf(capture, elf: Path, module: str, output: Path):
         chain = [CONTEXT_USER, ip]
         if svc & 0x80000000 and ip < 0x40000000:
             # In a syscall: the svc instruction in its stub, then the stub's caller.
-            chain += [relocate(pid, (user_pc & ~1) - 2), relocate(pid, caller(user_lr))]
+            # A frame read while the syscall began or ended can hold a zero PC or LR: left out.
+            chain += [relocate(pid, (pc_ & ~1) - 2) for pc_ in (user_pc,) if pc_ >= 2]
+            chain += [relocate(pid, caller(lr)) for lr in (user_lr,) if lr >= 4]
             in_syscall += 1
         payload = struct.pack('<QIIQIIQQ', ip, pid, thid, epoch + when - first, cpu & 3, 0, period, len(chain))
         events.append(record(RECORD_SAMPLE, MISC_USER, payload + struct.pack(f'<{len(chain)}Q', *chain)))
