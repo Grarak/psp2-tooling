@@ -29,8 +29,9 @@
 // Stacks (stack=BYTES in the request, off by default): stackhz times a second (stackcores, cores
 // by default) the sampler halts the core through its debug block (DBGDRCR.HRQ; invasive debug,
 // DBGAUTHSTATUS), reads r0-r15 and CPSR through the instruction transfer register, and in user
-// mode copies BYTES from SP with the halted core's own loads (LDC to the DCC in fast mode), so
-// the copy sees the memory map that core runs with. Then r0 goes back and the core restarts.
+// mode copies BYTES from SP with the halted core's own loads (LDC to the DCC; each page's first
+// word in normal mode, the rest in fast mode), so the copy sees the memory map that core runs
+// with and stops at the first page it cannot read. Then r0 goes back and the core restarts.
 // DBGDSCR's halting and monitor enables are left as they are (a halt request needs neither), and
 // the software lock is put back after the capture. A copy that faults stops there: in user mode
 // the DFSR and DFAR it sets belong to no exception in progress.
@@ -256,31 +257,51 @@ static void snapshot(uint32_t cpu, uint32_t now, uint32_t thid, uint32_t pid) {
             s->regs[0] = r0;
             s->regs[15] = pc - (cpsr & 0x20u ? 4u : 8u);
             s->cpsr = cpsr;
-            // r0 = SP, then fast mode: the LDC is latched in DBGITR, and each DBGDTRTX read returns
-            // what the DCC holds and issues it again. The first read returns what was there before
-            // the copy (the PC read above): dropped. The sticky abort flags are checked every 64
-            // words; a fault drops the block it showed in (where in it the copy faulted is unknown).
+            // r0 = SP, then page by page: the page's first word with one LDC in Normal mode, its
+            // sticky abort flags checked before anything else is read, so that a page the core
+            // cannot read ends the copy there. A DBGDTRTX read in Fast mode after an aborted LDC
+            // took the reading core down with an external abort (a stack shallower than BYTES,
+            // copied past its top into an unmapped page: a kernel DABT on core 3). The rest of a
+            // readable page goes in Fast mode: the LDC is latched in DBGITR, and each DBGDTRTX read
+            // returns what the DCC holds and issues it again, the first read the word before
+            // (dropped); the page's last word is read in Normal mode, which issues nothing.
             uint32_t n = 0;
-            int faulted = 0;
-            d[DBGDTRRX / 4] = s->regs[13] & ~3u;
+            const uint32_t want = stack_bytes / 4;
+            uint32_t addr = s->regs[13] & ~3u;
+            d[DBGDTRRX / 4] = addr;
             if (exec(d, MRC_DTRRX(0)) == 0) {
-                d[DBGDSCR / 4] = base | DSCR_ITREN | DSCR_DCC_FAST;
-                d[DBGITR / 4] = LDC_R0_POST4;
-                (void)d[DBGDTRTX / 4];
-                const uint32_t want = stack_bytes / 4;
-                while (n + 1 < want) {
-                    words[n] = d[DBGDTRTX / 4];
-                    if ((++n & 63u) == 0 && d[DBGDSCR / 4] & DSCR_STICKY) {
-                        faulted = 1;
+                while (n < want) {
+                    d[DBGDSCR / 4] = base | DSCR_ITREN;
+                    if (exec(d, LDC_R0_POST4) < 0 || d[DBGDSCR / 4] & DSCR_STICKY ||
+                        wait_dscr(d, DSCR_TXFULL) < 0) {
                         break;
                     }
-                }
-                d[DBGDSCR / 4] = base | DSCR_ITREN;
-                if (!faulted && wait_dscr(d, DSCR_TXFULL) == 0) {
                     words[n++] = d[DBGDTRTX / 4];
-                }
-                if (faulted || d[DBGDSCR / 4] & DSCR_STICKY) {
-                    n = n >= 64u ? (n - 1) / 64u * 64u : 0;
+                    addr += 4;
+                    // Words left in this page (none past its end: the next is probed first).
+                    uint32_t left = addr & 0xFFFu ? (0x1000u - (addr & 0xFFFu)) / 4u : 0;
+                    if (left > want - n) {
+                        left = want - n;
+                    }
+                    if (left == 0) {
+                        continue;
+                    }
+                    d[DBGDSCR / 4] = base | DSCR_ITREN | DSCR_DCC_FAST;
+                    d[DBGITR / 4] = LDC_R0_POST4;
+                    (void)d[DBGDTRTX / 4];
+                    for (uint32_t k = 1; k < left; k++) {
+                        words[n++] = d[DBGDTRTX / 4];
+                    }
+                    d[DBGDSCR / 4] = base | DSCR_ITREN;
+                    if (wait_dscr(d, DSCR_TXFULL) < 0) {
+                        break;
+                    }
+                    words[n++] = d[DBGDTRTX / 4];
+                    addr += left * 4u;
+                    if (d[DBGDSCR / 4] & DSCR_STICKY) {
+                        n -= left; // a page read in part: none of it
+                        break;
+                    }
                 }
                 wait_dscr(d, DSCR_INSTR_COMPL);
             }
