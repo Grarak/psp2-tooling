@@ -131,6 +131,45 @@ with `vita-make-fself -c`, then copy it to `ur0:data/`, where the recorder loads
 Live metrics need no Razor module: the recorder drives the Performance Analyzer through pamgr,
 which runs in development mode, and switches the SGX counters on as the HUD does.
 
+## Memory
+
+Measured on a PCH-2000 by listing every kernel memory block (heap sizes come from the modules'
+code; the kernel's own messages confirm DTrace's). With retail-cp and the 12 DevKit modules the
+kernel holds about 8.1 MiB more, in KiB:
+
+| Module | Code + data (KD) | Buffers, thread stacks | Heap (PhyCont) | Total |
+|---|---|---|---|---|
+| dtracep | 156 | 80 (4 stacks) | 4100 | 4336 |
+| vcp | 76 | 2048 screenshot frame (uncached) + 12 | 8 | 2144 |
+| dbgp | 100 | 204 buffer + 20 stack | 64 | 388 |
+| drfp | 28 | 272 (4 x 68 file buffers) | 4 | 304 |
+| dbgusb | 12 | 216 USB buffers (uncached) + 40 stacks | | 268 |
+| retail-cp | 136 | 76 (5 stacks) | | 212 |
+| loadp | 28 | 20 stack | 128 | 176 |
+| syslibtrace | 176 (100 of it its trace buffer) | | | 176 |
+| dfmgr | 36 | 84 buffer + 40 stacks | | 160 |
+| ttyp | 64 | | 4 | 68 |
+| ctrlp | 48 | | | 48 |
+| pamgr | 24 (plus 88 of register mappings, no RAM) | | | 24 |
+| userp | 16 | | | 16 |
+| **Total** | **900** | **3112** | **4308** | **8320** |
+
+- **By partition:** 976 KiB in KD (kernel RW, 1.6 MiB still free after boot); 5080 KiB cached
+  and 2264 KiB uncached in PhyCont (18.7 MiB still free, 18 MiB of it in one block).
+- **Shared with apps:** apps get their physically contiguous memory from the same PhyCont, so
+  an app can get at most about 18 MiB of it.
+- **Allocated at boot even when unused:** DTrace's 4-MiB heap and VCP's 2-MiB frame, about
+  three quarters of the total. retail-cp's setup thread keeps its 36-KiB stack after it ends.
+- **Profiling** (`vita_prof.py`, the call-stacks settings): about 320 KiB more PhyCont while
+  sampling (two more DTrace threads and threadmgr's 128-KiB DTrace heap, created on the first
+  attach). The 128 KiB stays until the next boot; samples go to the 4-MiB heap. That heap
+  filled during the call-stack profile: the kernel refused to grow it by 516 KiB, and the
+  profile still finished without drops.
+- **Razor:** nothing more in the kernel; everything is in the app's own memory. Live metrics
+  take a `trace-mib` buffer (8 MiB by default) from PhyCont for the trace window only, so the
+  recorder's 64-MiB maximum doesn't fit on retail. Capture loads `librazorcapture_es4` (284
+  KiB in the app). Any short-lived buffers of the capture itself (about 8 ms) weren't seen.
+
 ## Status
 
 On a real PCH-2000, firmware 3.65, development mode (which retail-cp keeps on). The test apps
