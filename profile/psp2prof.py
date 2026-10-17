@@ -8,6 +8,10 @@
 The request is a file the plugin polls (host0:psp2prof/request); it samples every core and
 streams HOST0/psp2prof/NAME.p2pf, which this waits for. perf_data.py turns it into perf.data.
 The plugin reports on the Vita's kernel TTY ([psp2prof] lines, devkit_console.py).
+
+--stack BYTES also takes user-mode stacks: --stack-hz times a second the plugin halts each core
+in --stack-cores through its debug block for its registers and BYTES from its SP (whatever the
+core runs, interrupts masked or not), then restarts it. unwind_snapshots.py --p2pf unwinds them.
 """
 import argparse
 import sys
@@ -24,6 +28,11 @@ def main():
     parser.add_argument('--cores', type=lambda v: int(v, 0), default=0x7,
                         help='core mask (default 0x7; core 3 runs the sampler, so its samples are the sampler)')
     parser.add_argument('--name', default='capture', help='[A-Za-z0-9._-] only')
+    parser.add_argument('--stack', type=int, default=0,
+                        help='stack bytes a snapshot, 256..16384 in 256s (default 0: no stacks)')
+    parser.add_argument('--stack-hz', type=int, default=100, help='snapshots a second per core')
+    parser.add_argument('--stack-cores', type=lambda v: int(v, 0), default=0,
+                        help='cores to snapshot (default: --cores; never core 3)')
     parser.add_argument('--timeout', type=float, default=30.0,
                         help='seconds past the capture to wait for its file')
     args = parser.parse_args()
@@ -33,7 +42,9 @@ def main():
     done.unlink(missing_ok=True)
     request = directory / 'request'
     pending = directory / 'request.tmp'
-    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x} name={args.name}\n')
+    stack = (f' stack={args.stack} stackhz={args.stack_hz} stackcores={args.stack_cores or args.cores:#x}'
+             if args.stack else '')
+    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x}{stack} name={args.name}\n')
     pending.rename(request)
     end = time.monotonic() + args.seconds + args.timeout
     while time.monotonic() < end:
@@ -42,6 +53,8 @@ def main():
             return
         time.sleep(0.2)
     taken = not request.exists()
+    # Not taken: withdrawn, or the next boot's plugin would take it on its own.
+    request.unlink(missing_ok=True)
     sys.exit(f'no {done} after {args.seconds + args.timeout:g} s; the request was '
              + ('taken: see the [psp2prof] lines on the kernel TTY' if taken else
                 'not taken: is the plugin loaded (launch PSP2PROF0) and host0 served?'))

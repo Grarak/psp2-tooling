@@ -21,7 +21,19 @@
 //   THRD  u32 thid, u32 pid, char name[32]: each thread the samples name
 //   MODL  u32 pid, u32 vaddr, u32 memsz, u32 perms | segment << 8, char name[28]: the segments
 //         of the kernel's modules (pid 0x10005) and of each sampled process's
+//   STAK  (with stack=BYTES) Snapshot below, then its stack bytes: a core caught in user mode
+//   SDRP  u32: snapshots lost to a full ring, then those not taken: the core in a privileged
+//         mode, in Debug state already or powered down, its halt or a debug step timing out
 //   END   u32 0
+//
+// Stacks (stack=BYTES in the request, off by default): stackhz times a second (stackcores, cores
+// by default) the sampler halts the core through its debug block (DBGDRCR.HRQ; invasive debug,
+// DBGAUTHSTATUS), reads r0-r15 and CPSR through the instruction transfer register, and in user
+// mode copies BYTES from SP with the halted core's own loads (LDC to the DCC in fast mode), so
+// the copy sees the memory map that core runs with. Then r0 goes back and the core restarts.
+// DBGDSCR's halting and monitor enables are left as they are (a halt request needs neither), and
+// the software lock is put back after the capture. A copy that faults stops there: in user mode
+// the DFSR and DFAR it sets belong to no exception in progress.
 
 #include <psp2kern/io/dirent.h>
 #include <psp2kern/io/fcntl.h>
@@ -71,6 +83,45 @@ extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset
 #define FRAME_SIZE 0x60u
 #define SVC_FLAG 0x80000000u
 
+// The debug registers used for stacks (ARMv7 debug, memory-mapped view).
+#define DBGDTRRX 0x080u
+#define DBGITR 0x084u // written; the same offset reads DBGPCSR
+#define DBGDSCR 0x088u
+#define DBGDTRTX 0x08Cu
+#define DBGDRCR 0x090u
+#define DBGOSLSR 0x304u
+#define DBGPRSR 0x314u
+#define DBGLAR 0xFB0u
+#define DBGLSR 0xFB4u
+#define DSCR_HALTED (1u << 0)
+#define DSCR_RESTARTED (1u << 1)
+#define DSCR_STICKY (7u << 6) // SDABORT_l, ADABORT_l, UND_l
+#define DSCR_ITREN (1u << 13)
+#define DSCR_DCC_MODE (3u << 20)
+#define DSCR_DCC_FAST (2u << 20)
+#define DSCR_INSTR_COMPL (1u << 24)
+#define DSCR_TXFULL (1u << 29)
+#define DSCR_WRITABLE (DSCR_DCC_MODE | 0xFC00u) // ExtDCCmode, MDBGen, HDBGen, ITRen, UDCCdis, INTdis, DBGack
+#define DRCR_HALT 1u
+#define DRCR_RESTART 2u
+#define DRCR_CLEAR_STICKY 4u
+// ARM encodings, executed through DBGITR in Debug state.
+#define MCR_DTRTX(rt) (0xEE000E15u | (rt) << 12) // mcr p14, 0, rt, c0, c5, 0
+#define MRC_DTRRX(rt) (0xEE100E15u | (rt) << 12) // mrc p14, 0, rt, c0, c5, 0
+#define MOV_R0_PC 0xE1A0000Fu
+#define MRS_R0_CPSR 0xE10F0000u
+#define LDC_R0_POST4 0xECB05E01u // ldc p14, c5, [r0], #4
+#define STACK_MAX 16384u
+#define STACK_RING 64u
+
+typedef struct Snapshot {
+    uint32_t time; // ksceKernelGetSystemTimeLow, microseconds
+    uint32_t thid, pid, cpu;
+    uint32_t regs[16]; // r15: the instruction the core stopped at
+    uint32_t cpsr;
+    uint32_t size; // stack bytes that follow (the copy stops at a fault)
+} Snapshot;
+
 typedef struct Sample {
     uint32_t time;    // ksceKernelGetSystemTimeLow, microseconds
     uint32_t pc;
@@ -93,6 +144,12 @@ static volatile uint32_t *dbg;
 static Sample *ring;
 static volatile uint32_t head, tail, dropped, sampling, unloading;
 static uint32_t period_us, core_mask;
+static uint32_t stack_bytes, stack_every, stack_mask, stack_relock;
+static SceUID stack_uid = -1;
+static uint8_t *stack_ring; // STACK_RING slots of a Snapshot and STACK_MAX bytes
+static volatile uint32_t stack_head, stack_tail, stack_dropped;
+static volatile uint32_t stack_kernel, stack_busy, stack_no_halt, stack_no_step;
+#define STACK_SLOT (sizeof(Snapshot) + STACK_MAX)
 static SceUID sampler_thid = -1, last_sampler = -1, control_thid = -1;
 static Sample chunk[CHUNK];
 static uint32_t threads[MAX_THREADS]; // open addressing, 0 empty
@@ -131,6 +188,128 @@ static void syscall_frame(uint32_t cpu, Sample *s) {
     s->svc = SVC_FLAG | number;
 }
 
+// Debug state through core `cpu`'s debug block: each step polls a bounded number of times, and a
+// step that never completes gives up (the core is restarted all the same).
+#define POLLS 100000u
+static int wait_dscr(volatile uint32_t *d, uint32_t bit) {
+    for (uint32_t i = 0; i < POLLS; i++) {
+        if (d[DBGDSCR / 4] & bit) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int exec(volatile uint32_t *d, uint32_t insn) {
+    d[DBGITR / 4] = insn;
+    return wait_dscr(d, DSCR_INSTR_COMPL);
+}
+
+static int read_reg(volatile uint32_t *d, uint32_t rt, uint32_t *value) {
+    if (exec(d, MCR_DTRTX(rt)) < 0 || wait_dscr(d, DSCR_TXFULL) < 0) {
+        return -1;
+    }
+    *value = d[DBGDTRTX / 4];
+    return 0;
+}
+
+// Halts `cpu`, and in user mode takes its registers and stack into the next ring slot; restarts
+// it in any case. Interrupts stay off on this core meanwhile, so the halt lasts the copy only.
+static void snapshot(uint32_t cpu, uint32_t now, uint32_t thid, uint32_t pid) {
+    volatile uint32_t *const d = dbg + cpu * 0x2000u / 4;
+    const uint32_t h = stack_head;
+    if (h - stack_tail >= STACK_RING) {
+        stack_dropped++;
+        return;
+    }
+    const uint32_t dscr0 = d[DBGDSCR / 4];
+    if (dscr0 & DSCR_HALTED || !(d[DBGPRSR / 4] & 1u)) {
+        stack_busy++; // in Debug state already (someone else's), or powered down
+        return;
+    }
+    uint32_t irq;
+    asm volatile("mrs %0, cpsr\n\tcpsid i" : "=r"(irq)::"memory");
+    Snapshot *const s = (Snapshot *)(stack_ring + (h & (STACK_RING - 1)) * STACK_SLOT);
+    uint32_t *const words = (uint32_t *)(s + 1);
+    int ok = 0;
+    d[DBGDRCR / 4] = DRCR_HALT;
+    if (wait_dscr(d, DSCR_HALTED) == 0) {
+        const uint32_t base = d[DBGDSCR / 4] & DSCR_WRITABLE & ~DSCR_DCC_MODE;
+        d[DBGDSCR / 4] = base | DSCR_ITREN;
+        uint32_t r0 = 0, cpsr = 0, pc = 0;
+        const int have_r0 = read_reg(d, 0, &r0) == 0;
+        const int have_cpsr = have_r0 && exec(d, MRS_R0_CPSR) == 0 && read_reg(d, 0, &cpsr) == 0;
+        ok = have_cpsr && (cpsr & 0x1Fu) == 0x10u;
+        if (have_cpsr && !ok) {
+            stack_kernel++;
+        }
+        for (uint32_t r = 1; ok && r < 15; r++) {
+            ok = read_reg(d, r, &s->regs[r]) == 0;
+        }
+        // PC reads as the resume address plus 8 in ARM state, plus 4 in Thumb.
+        ok = ok && exec(d, MOV_R0_PC) == 0 && read_reg(d, 0, &pc) == 0;
+        if (!ok && (!have_cpsr || (cpsr & 0x1Fu) == 0x10u)) {
+            stack_no_step++;
+        }
+        s->size = 0;
+        if (ok) {
+            s->regs[0] = r0;
+            s->regs[15] = pc - (cpsr & 0x20u ? 4u : 8u);
+            s->cpsr = cpsr;
+            // r0 = SP, then fast mode: the LDC is latched in DBGITR, and each DBGDTRTX read returns
+            // what the DCC holds and issues it again. The first read returns what was there before
+            // the copy (the PC read above): dropped. The sticky abort flags are checked every 64
+            // words; a fault drops the block it showed in (where in it the copy faulted is unknown).
+            uint32_t n = 0;
+            int faulted = 0;
+            d[DBGDTRRX / 4] = s->regs[13] & ~3u;
+            if (exec(d, MRC_DTRRX(0)) == 0) {
+                d[DBGDSCR / 4] = base | DSCR_ITREN | DSCR_DCC_FAST;
+                d[DBGITR / 4] = LDC_R0_POST4;
+                (void)d[DBGDTRTX / 4];
+                const uint32_t want = stack_bytes / 4;
+                while (n + 1 < want) {
+                    words[n] = d[DBGDTRTX / 4];
+                    if ((++n & 63u) == 0 && d[DBGDSCR / 4] & DSCR_STICKY) {
+                        faulted = 1;
+                        break;
+                    }
+                }
+                d[DBGDSCR / 4] = base | DSCR_ITREN;
+                if (!faulted && wait_dscr(d, DSCR_TXFULL) == 0) {
+                    words[n++] = d[DBGDTRTX / 4];
+                }
+                if (faulted || d[DBGDSCR / 4] & DSCR_STICKY) {
+                    n = n >= 64u ? (n - 1) / 64u * 64u : 0;
+                }
+                wait_dscr(d, DSCR_INSTR_COMPL);
+            }
+            s->size = n * 4;
+        }
+        // The sticky aborts cleared first (DBGITR is ignored while one is set), r0 back, then
+        // Debug state left.
+        d[DBGDRCR / 4] = DRCR_CLEAR_STICKY;
+        if (have_r0) {
+            d[DBGDTRRX / 4] = r0;
+            exec(d, MRC_DTRRX(0));
+        }
+        d[DBGDSCR / 4] = base;
+        d[DBGDRCR / 4] = DRCR_CLEAR_STICKY | DRCR_RESTART;
+        wait_dscr(d, DSCR_RESTARTED);
+    } else {
+        stack_no_halt++;
+    }
+    asm volatile("msr cpsr_c, %0" ::"r"(irq) : "memory");
+    if (ok) {
+        s->time = now;
+        s->thid = thid;
+        s->pid = pid;
+        s->cpu = cpu;
+        asm volatile("dmb" ::: "memory");
+        stack_head = h + 1;
+    }
+}
+
 static int sampler(SceSize args, void *argp) {
     (void)args;
     (void)argp;
@@ -160,6 +339,9 @@ static int sampler(SceSize args, void *argp) {
             }
             asm volatile("dmb" ::: "memory");
             head = h + 1;
+            if (stack_bytes && stack_mask & (1u << cpu) && seq % stack_every == 0) {
+                snapshot(cpu, now, s->thid, s->pid);
+            }
         }
         seq++;
         ksceKernelDelayThread(period_us);
@@ -202,9 +384,40 @@ static void stop_sampler(void) {
         ksceKernelDeleteThread(sampler_thid);
         sampler_thid = -1;
     }
+    // The software locks the capture opened, closed again (any value but the key locks).
+    for (uint32_t cpu = 0; cpu < 4; cpu++) {
+        if (stack_relock & (1u << cpu)) {
+            dbg[(cpu * 0x2000u + DBGLAR) / 4] = 0;
+        }
+    }
+    stack_relock = 0;
 }
 
-static int start_sampler(uint32_t hz, uint32_t cores) {
+// Stacks on the cores in `mask` that allow them: powered, not OS-locked (whoever set the OS lock
+// owns the debug registers), the software lock opened for the capture. Returns those cores.
+static uint32_t open_stacks(uint32_t mask) {
+    uint32_t usable = 0;
+    for (uint32_t cpu = 0; cpu < 4; cpu++) {
+        if (!(mask & (1u << cpu))) {
+            continue;
+        }
+        volatile uint32_t *const d = dbg + cpu * 0x2000u / 4;
+        if (!(d[DBGPRSR / 4] & 1u) || d[DBGOSLSR / 4] & 2u) {
+            ksceKernelPrintf("[psp2prof] cpu%u: no stacks (DBGPRSR %08X DBGOSLSR %08X)\n", cpu,
+                             d[DBGPRSR / 4], d[DBGOSLSR / 4]);
+            continue;
+        }
+        if (d[DBGLSR / 4] & 2u) {
+            d[DBGLAR / 4] = 0xC5ACCE55u;
+            stack_relock |= 1u << cpu;
+        }
+        usable |= 1u << cpu;
+    }
+    return usable;
+}
+
+static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t stack_hz,
+                         uint32_t stack_cores) {
     if (!cpucb && !(cpucb = find_cpucb())) {
         ksceKernelPrintf("[psp2prof] SceKernelThreadMgr's per-CPU blocks not found (not 3.65?)\n");
         return -1;
@@ -238,9 +451,28 @@ static int start_sampler(uint32_t hz, uint32_t cores) {
         }
         ring = base;
     }
+    if (stack && stack_uid < 0) {
+        void *base = NULL;
+        stack_uid = ksceKernelAllocMemBlock("psp2prof_stacks", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
+                                            (STACK_RING * STACK_SLOT + 0xFFFu) & ~0xFFFu, NULL);
+        if (stack_uid < 0)
+            stack_uid = ksceKernelAllocMemBlock("psp2prof_stacks", 0x1080d006,
+                                                (STACK_RING * STACK_SLOT + 0xFFFu) & ~0xFFFu, NULL);
+        if (stack_uid < 0 || ksceKernelGetMemBlockBase(stack_uid, &base) < 0) {
+            ksceKernelPrintf("[psp2prof] the stack ring failed: 0x%08X\n", stack_uid);
+            stack_uid = -1;
+            return -1;
+        }
+        stack_ring = base;
+    }
     head = tail = dropped = 0;
+    stack_head = stack_tail = stack_dropped = 0;
+    stack_kernel = stack_busy = stack_no_halt = stack_no_step = 0;
     period_us = 1000000u / hz;
     core_mask = cores;
+    stack_bytes = stack;
+    stack_every = stack ? (hz / stack_hz ? hz / stack_hz : 1u) : 1u;
+    stack_mask = stack ? open_stacks(stack_cores) : 0;
     sampling = 1;
     sampler_thid = ksceKernelCreateThread("psp2prof_sampler", sampler, 0x10000100, 0x1000, 0,
                                           CPU_AFFINITY(3), NULL);
@@ -316,6 +548,27 @@ static void note_pid(uint32_t pid) {
     }
 }
 
+// Moves the snapshots the sampler took into STAK records.
+static int drain_stacks(SceUID fd, uint32_t *count) {
+    while (stack_tail != stack_head) {
+        const Snapshot *s = (const Snapshot *)(stack_ring + (stack_tail & (STACK_RING - 1)) * STACK_SLOT);
+        static const uint32_t zero = 0;
+        const uint32_t size = sizeof(Snapshot) + s->size;
+        emit(fd, "STAK", 4);
+        emit(fd, &size, 4);
+        emit(fd, s, size);
+        emit(fd, &zero, (4 - (size & 3u)) & 3u);
+        note_thread(s->thid);
+        note_pid(s->pid);
+        stack_tail++;
+        ++*count;
+        if (out_failed) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 // Moves what the sampler left in the ring into SMPL records.
 static int drain(SceUID fd, uint32_t *count) {
     static uint32_t filled;
@@ -385,7 +638,8 @@ static void write_modules(SceUID fd, uint32_t pid) {
     }
 }
 
-static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, const char *name) {
+static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stack,
+                    uint32_t stack_hz, uint32_t stack_cores, const char *name) {
     char part[96], done[96];
     snprintf(part, sizeof(part), DIR "%s.part", name);
     snprintf(done, sizeof(done), DIR "%s.p2pf", name);
@@ -397,9 +651,9 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, const char *n
     memset(threads, 0, sizeof(threads));
     npids = 0;
     note_pid(KERNEL_PID);
-    const int auth = start_sampler(hz, cores);
+    const int auth = start_sampler(hz, cores, stack, stack_hz, stack_cores);
     const uint32_t header[8] = {0x46503250, 1, hz, cores, (uint32_t)auth, 0, 0, 0}; // P2PF
-    uint32_t count = 0;
+    uint32_t count = 0, stacks = 0;
     out_len = 0;
     out_failed = 0;
     emit(fd, header, sizeof(header));
@@ -407,12 +661,17 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, const char *n
     const uint32_t start = ksceKernelGetSystemTimeLow();
     while (!failed && !unloading && ksceKernelGetSystemTimeLow() - start < seconds * 1000000u) {
         ksceKernelDelayThread(20000);
-        failed = drain(fd, &count) < 0;
+        failed = drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0;
     }
     stop_sampler();
-    failed = failed || drain(fd, &count) < 0;
+    failed = failed || drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0;
     const uint32_t lost = dropped;
     put(fd, "DROP", &lost, sizeof(lost));
+    if (stack) {
+        const uint32_t sdrp[5] = {stack_dropped, stack_kernel, stack_busy, stack_no_halt,
+                                  stack_no_step};
+        put(fd, "SDRP", sdrp, sizeof(sdrp));
+    }
     for (uint32_t i = 0; i < MAX_THREADS; i++) {
         if (!threads[i]) {
             continue;
@@ -451,6 +710,12 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, const char *n
     ksceIoRename(part, done);
     ksceKernelPrintf("[psp2prof] %s: %u samples, %u dropped, %u processes\n", done, count, lost,
                      npids);
+    if (stack) {
+        ksceKernelPrintf("[psp2prof] %s: %u stacks, %u dropped; not taken: %u privileged, %u in "
+                         "Debug state or powered down, %u halts and %u steps timed out\n",
+                         done, stacks, stack_dropped, stack_kernel, stack_busy, stack_no_halt,
+                         stack_no_step);
+    }
 }
 
 static uint32_t number(const char *text) {
@@ -472,10 +737,11 @@ static uint32_t number(const char *text) {
     }
 }
 
-// "seconds=S hz=H cores=MASK name=NAME" (defaults 4, 1000, 0x7, capture); a name keeps
+// "seconds=S hz=H cores=MASK name=NAME" (defaults 4, 1000, 0x7, capture), and for stacks
+// "stack=BYTES stackhz=H stackcores=MASK" (defaults 0: none, 100, the cores); a name keeps
 // [A-Za-z0-9._-] only.
 static void request(char *text) {
-    uint32_t seconds = 4, hz = 1000, cores = 0x7;
+    uint32_t seconds = 4, hz = 1000, cores = 0x7, stack = 0, stack_hz = 100, stack_cores = 0;
     char name[48] = "capture";
     for (char *p = text; *p;) {
         while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') {
@@ -487,6 +753,12 @@ static void request(char *text) {
             hz = number(p + 3);
         } else if (!strncmp(p, "cores=", 6)) {
             cores = number(p + 6);
+        } else if (!strncmp(p, "stack=", 6)) {
+            stack = number(p + 6);
+        } else if (!strncmp(p, "stackhz=", 8)) {
+            stack_hz = number(p + 8);
+        } else if (!strncmp(p, "stackcores=", 11)) {
+            stack_cores = number(p + 11);
         } else if (!strncmp(p, "name=", 5)) {
             uint32_t n = 0;
             for (const char *q = p + 5; *q && n < sizeof(name) - 1; q++) {
@@ -503,13 +775,22 @@ static void request(char *text) {
             p++;
         }
     }
-    if (!seconds || seconds > 600 || hz < 10 || hz > 10000 || !cores || cores > 0xF || !name[0]) {
-        ksceKernelPrintf("[psp2prof] refused: seconds 1..600, hz 10..10000, cores 0x1..0xF\n");
+    stack_cores = stack_cores ? stack_cores : cores;
+    if (!seconds || seconds > 600 || hz < 10 || hz > 10000 || !cores || cores > 0xF || !name[0] ||
+        (stack && (stack < 64 || stack > STACK_MAX || stack % 256 || !stack_hz || stack_hz > hz ||
+                   stack_cores & ~cores & 0xFu || stack_cores & 8u))) {
+        ksceKernelPrintf("[psp2prof] refused: seconds 1..600, hz 10..10000, cores 0x1..0xF; stack "
+                         "256..%u in 256s, stackhz 1..hz, stackcores within cores, not core 3\n",
+                         STACK_MAX);
         return;
     }
     ksceKernelPrintf("[psp2prof] capturing %s: %u s at %u Hz, cores 0x%X\n", name, seconds, hz,
                      cores);
-    capture(seconds, hz, cores, name);
+    if (stack) {
+        ksceKernelPrintf("[psp2prof] with stacks: %u bytes at %u Hz, cores 0x%X\n", stack, stack_hz,
+                         stack_cores);
+    }
+    capture(seconds, hz, cores, stack, stack_hz, stack_cores, name);
 }
 
 static int control(SceSize args, void *argp) {
@@ -563,6 +844,9 @@ int module_stop(SceSize args, void *argp) {
     stop_sampler();
     if (ring_uid >= 0) {
         ksceKernelFreeMemBlock(ring_uid);
+    }
+    if (stack_uid >= 0) {
+        ksceKernelFreeMemBlock(stack_uid);
     }
     if (dbg_uid >= 0) {
         ksceKernelFreeMemBlock(dbg_uid);

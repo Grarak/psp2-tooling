@@ -9,6 +9,10 @@ turns them into perf.data callchains.
 
     profile/unwind_snapshots.py --info RUN/prof.register-info.json --elf app.elf --out RUN/cfi
 
+Or psp2prof's stack snapshots (psp2prof.py --stack: STAK records in NAME.p2pf) of one process:
+
+    profile/unwind_snapshots.py --p2pf RUN/race.p2pf --pid PID --elf app.elf --out RUN/cfi
+
 Unwinding goes through elfutils' libdwfl (libdw.so.1, arm32_cfi.py): it never scans a
 stack for plausible addresses or guesses LR, and stops where the captured bytes end.
 """
@@ -164,6 +168,44 @@ def read_capture(path):
     return info,rows,samples
 
 
+def read_p2pf(path, pid, elf_path):
+    """psp2prof's STAK records of process `pid` as read_capture's (info, rows, samples)."""
+    data = Path(path).read_bytes()
+    magic, version, hz = struct.unpack_from('<4sII', data)
+    require(magic == b'P2PF' and version == 1, f'{path}: not a psp2prof capture')
+    rows, generated, at, total = [], ['cpu timestamp upc kpc tid pid'], 32, 0
+    while at + 8 <= len(data):
+        tag, size = struct.unpack_from('<4sI', data, at)
+        payload = data[at + 8:at + 8 + size]
+        at += 8 + size + (-size % 4)
+        if tag == b'END ':
+            break
+        if tag != b'STAK':
+            continue
+        total += 1
+        when, tid, spid, cpu = struct.unpack_from('<4I', payload)
+        regs = list(struct.unpack_from('<16I', payload, 16))
+        cpsr, stack_size = struct.unpack_from('<2I', payload, 80)
+        if spid != pid:
+            continue
+        upc = regs[15] | (cpsr >> 5 & 1)
+        reason = None
+        if not 0x40000000 <= regs[13] < 0xffffffff or regs[13] % 4:
+            reason = 'invalid_user_stack_pointer'
+        row = dict(event_index=len(rows), cpu=cpu & 3, timestamp=when, upc=upc, kpc=0, tid=tid, pid=pid,
+                   registers=regs, stack_offset=0, context_error=reason,
+                   raw_stack=payload[88:88 + stack_size])
+        rows.append(row)
+        generated.append(' '.join(str(v) if i == 0 else f'{v:#x}' for i, v in
+                                  enumerate((row['cpu'], when, upc, 0, tid, pid))))
+    require(rows, f'{path}: no stack snapshots of process {pid:#x} (of {total})')
+    elf_sha = packaging.sha(Path(elf_path).read_bytes())
+    info = dict(hz=hz, selected_pid=pid, recorded_elf_sha256=elf_sha,
+                loaded_text_base=VitaElf(elf_path, elf_sha).base, primary_samples=total,
+                primary_user_samples=total, aggregate_errors=0, aggregate_drops=0)
+    return info, rows, ('\n'.join(generated) + '\n').encode()
+
+
 class DwarfOp(engine.C.Structure):
     _fields_ = [('atom',engine.C.c_uint8),('number',engine.U),
                 ('number2',engine.U),('offset',engine.U)]
@@ -309,9 +351,9 @@ class RawCfiObserver:
         return None
 
 
-def analyze(info_path,elf_path,output,max_depth=64):
+def analyze(info_path,elf_path,output,max_depth=64,pid=None):
     require(type(max_depth) is int and 1 <= max_depth <= 256, 'Depth must be 1..256')
-    info,rows,samples = read_capture(info_path)
+    info,rows,samples = read_p2pf(info_path,pid,elf_path) if pid is not None else read_capture(info_path)
     elf = VitaElf(elf_path,info['recorded_elf_sha256'])
     require(type(info['loaded_text_base']) is int and info['loaded_text_base'] == elf.base,
             'Relocated/unknown ET_EXEC load base is unsupported (build the SELF with vita-make-fself -na)')
@@ -379,12 +421,18 @@ def analyze(info_path,elf_path,output,max_depth=64):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--info',type=Path,required=True,help='vita_prof OUT.register-info.json')
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument('--info',type=Path,help='vita_prof OUT.register-info.json')
+    source.add_argument('--p2pf',type=Path,help="a psp2prof capture with stacks (psp2prof.py --stack)")
+    parser.add_argument('--pid',type=lambda v: int(v,0),help="--p2pf: the process whose stacks to unwind")
     parser.add_argument('--elf',type=Path,required=True,help='the exact unstripped ELF that ran')
     parser.add_argument('--out',type=Path,required=True,help='Derived snapshot output prefix')
     parser.add_argument('--max-depth',type=int,default=64)
     args=parser.parse_args()
-    print(json.dumps(analyze(args.info,args.elf,args.out,args.max_depth),indent=2))
+    if args.p2pf and args.pid is None:
+        parser.error('--p2pf needs --pid')
+    print(json.dumps(analyze(args.info or args.p2pf,args.elf,args.out,args.max_depth,
+                             args.pid if args.p2pf else None),indent=2))
 
 
 if __name__ == '__main__':
