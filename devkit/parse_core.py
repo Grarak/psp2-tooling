@@ -15,6 +15,10 @@ UID) pair per waiter. Space after the last entry is zero.
 The layouts were read from firmware 3.60 dumps; fields not understood are
 printed as raw words rather than left out. SYSTEM_INFO2 is encrypted.
 
+A dump cut short (the .psp2dmp.tmp of a dump stopped partway) is read as far
+as it goes: the gzip stream's written part, the notes, and the segments up to
+the end (a warning names the segments left short).
+
   devkit/parse_core.py CORE --elf eboot.elf
   devkit/parse_core.py CORE --elf eboot.elf --backtrace
   devkit/parse_core.py CORE --gdb-core core.arm --json core.json
@@ -26,7 +30,6 @@ NT_ARM_VFP per thread, the faulting thread first, and the saved memory), so
 """
 import argparse
 from dataclasses import dataclass, field
-import gzip
 import json
 from pathlib import Path
 import re
@@ -35,6 +38,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import zlib
 
 NOTE_TYPES = {
     0x1000: 'COREFILE_INFO', 0x1001: 'SYSTEM_INFO', 0x1002: 'PROCESS_INFO', 0x1003: 'THREAD_INFO',
@@ -108,7 +112,8 @@ class Segment:
 class Core:
     def __init__(self, raw):
         if raw[:2] == b'\x1f\x8b':
-            raw = gzip.decompress(raw)
+            # A stream cut short decompresses as far as it was written.
+            raw = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw)
         if raw[:4] != b'\x7fELF' or raw[4] != 1 or raw[5] != 1:
             raise ValueError('not a little-endian ELF32 core dump')
         phoff, = struct.unpack_from('<I', raw, 28)
@@ -118,7 +123,9 @@ class Core:
         for index in range(phnum):
             kind, offset, address, _, filesz, _, flags, _ = struct.unpack_from('<8I', raw, phoff + index * phentsize)
             if offset + filesz > len(raw):
-                raise ValueError('segment %d extends past the end of the dump' % index)
+                print('warning: segment %d (%#x, %#x bytes) cut short at %#x bytes' %
+                      (index, address, filesz, max(len(raw) - offset, 0)), file=sys.stderr)
+                filesz = max(len(raw) - offset, 0)
             if kind == 1:
                 self.segments.append(Segment(address, raw[offset:offset + filesz], flags))
             elif kind == 4:
