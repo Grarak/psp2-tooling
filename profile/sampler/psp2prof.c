@@ -206,6 +206,20 @@ static int exec(volatile uint32_t *d, uint32_t insn) {
     return wait_dscr(d, DSCR_INSTR_COMPL);
 }
 
+// The LDC issued last complete, its word in the DCC: 0; a sticky abort (or a timeout): -1.
+static int wait_word(volatile uint32_t *d) {
+    for (uint32_t i = 0; i < POLLS; i++) {
+        const uint32_t dscr = d[DBGDSCR / 4];
+        if (dscr & DSCR_STICKY) {
+            return -1;
+        }
+        if ((dscr & (DSCR_INSTR_COMPL | DSCR_TXFULL)) == (DSCR_INSTR_COMPL | DSCR_TXFULL)) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 static int read_reg(volatile uint32_t *d, uint32_t rt, uint32_t *value) {
     if (exec(d, MCR_DTRTX(rt)) < 0 || wait_dscr(d, DSCR_TXFULL) < 0) {
         return -1;
@@ -264,7 +278,10 @@ static void snapshot(uint32_t cpu, uint32_t now, uint32_t thid, uint32_t pid) {
             // copied past its top into an unmapped page: a kernel DABT on core 3). The rest of a
             // readable page goes in Fast mode: the LDC is latched in DBGITR, and each DBGDTRTX read
             // returns what the DCC holds and issues it again, the first read the word before
-            // (dropped); the page's last word is read in Normal mode, which issues nothing.
+            // (dropped); the page's last word is read in Normal mode, which issues nothing. A page
+            // can stop being readable during its copy (another core remapping it: an emulator's
+            // guest stack), so each word waits for its LDC to complete and the sticky aborts are
+            // checked before DBGDTRTX is read.
             uint32_t n = 0;
             const uint32_t want = stack_bytes / 4;
             uint32_t addr = s->regs[13] & ~3u;
@@ -289,19 +306,22 @@ static void snapshot(uint32_t cpu, uint32_t now, uint32_t thid, uint32_t pid) {
                     d[DBGDSCR / 4] = base | DSCR_ITREN | DSCR_DCC_FAST;
                     d[DBGITR / 4] = LDC_R0_POST4;
                     (void)d[DBGDTRTX / 4];
-                    for (uint32_t k = 1; k < left; k++) {
+                    uint32_t k = 0;
+                    for (; k < left; k++) {
+                        if (wait_word(d) < 0) {
+                            break;
+                        }
+                        if (k == left - 1) {
+                            d[DBGDSCR / 4] = base | DSCR_ITREN;
+                        }
                         words[n++] = d[DBGDTRTX / 4];
                     }
-                    d[DBGDSCR / 4] = base | DSCR_ITREN;
-                    if (wait_dscr(d, DSCR_TXFULL) < 0) {
+                    if (k < left) {
+                        d[DBGDSCR / 4] = base | DSCR_ITREN;
+                        n -= k; // a page read in part: none of it
                         break;
                     }
-                    words[n++] = d[DBGDTRTX / 4];
                     addr += left * 4u;
-                    if (d[DBGDSCR / 4] & DSCR_STICKY) {
-                        n -= left; // a page read in part: none of it
-                        break;
-                    }
                 }
                 wait_dscr(d, DSCR_INSTR_COMPL);
             }
