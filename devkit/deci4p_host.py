@@ -13,11 +13,15 @@ With --control it also listens on a second Unix socket for one-line input
 commands, "launch host0:/app/eboot.bin" among them; devkit/psp2_input.py is the
 client.
 
-There are two ways to reach the Vita.  With --usb it drives the Vita's own USB
+There are three ways to reach the Vita.  With --usb it drives the Vita's own USB
 port (the UDC port, 054C:04CD) through this machine's USB stack with libusb, as
 a PC does.  With --cp-usb it uses the DevKit's mini-USB 054C:0432 and addresses the Vita's
 debug-SDIO node 0xA000 through the CP board. Only protocols registered on
 that SDIO unit respond; VitaOS VCP on the tested 3.65 DevKit uses USB unit 1.
+With --socket it listens on a Unix socket for the raw DECI4p byte stream of an
+emulated Vita instead, which an emulator connects to as a socket chardev, for
+example QEMU's -chardev socket,id=usb-host,path=SOCKET,reconnect-ms=100.  A
+link that closes, as on an emulated reset, is accepted again.
 
 Either way it writes deci4p.log, a decoded record of every packet, to --log-dir,
 and tty.log (named after --log-name: deci4p-cp.log gives tty-cp.log), the text of
@@ -1668,6 +1672,12 @@ def serve(args):
     with open(args.log_dir / args.log_name, 'w') as log, \
             open(args.log_dir / args.log_name.replace('deci4p', 'tty'), 'w') as tty_log:
         args.tty_log = tty_log
+        if args.socket:
+            with listener_socket(args.socket, 1) as listener:
+                while True:
+                    sock, _ = listener.accept()
+                    with sock:
+                        run_link(sock, control, args, log, 'connected')
         link = UsbLink(product=CP_USB_PRODUCT if args.cp_usb else USB_PRODUCT)
         print(link.describe(), flush=True)
         try:
@@ -1682,6 +1692,8 @@ def main():
                         help=f'drive the Vita\'s USB port, {USB_VENDOR:04x}:{USB_PRODUCT:04x}')
     parser.add_argument('--cp-usb', action='store_true',
                         help='drive the DevKit mini-USB 054c:0432 through its CP board')
+    parser.add_argument('--socket', type=Path,
+                        help="listen on this Unix socket for an emulated Vita's DECI4p stream")
     parser.add_argument('--log-dir', type=Path, default=Path('.'),
                         help='directory for the packet log')
     parser.add_argument('--log-name', default='deci4p.log',
@@ -1705,8 +1717,8 @@ def main():
                         help='destination node for packets to the Vita (default 0xA000 with '
                              '--cp-usb, otherwise 0xA100)')
     args = parser.parse_args()
-    if args.usb == args.cp_usb:
-        parser.error('give one of --usb and --cp-usb')
+    if sum((args.usb, args.cp_usb, bool(args.socket))) != 1:
+        parser.error('give one of --usb, --cp-usb and --socket')
     if args.vita_node is None:
         args.vita_node = NODE_VITA_SDIO if args.cp_usb else NODE_VITA_USB
     if not args.host0.is_dir():
