@@ -24,6 +24,11 @@
 //   STAK  (with stack=BYTES) Snapshot below, then its stack bytes: a core caught in user mode
 //   SDRP  u32: snapshots lost to a full ring, then those not taken: the core in a privileged
 //         mode, in Debug state already or powered down, its halt or a debug step timing out
+//   WAIT  (with waits=PID) WaitSample below: each watched thread's state, running or not
+//   WDRP  u32: wait samples lost to a full ring, then the watched threads' count
+//   WOBJ  u32 wait id, u32 wait type, s32 result, char name[32]: each object the watched
+//         threads waited on, named by its Get*Info call (result: that call's, or 0x80020001 for
+//         a wait type without one)
 //   END   u32 0
 //
 // Stacks (stack=BYTES in the request, off by default): stackhz times a second (stackcores, cores
@@ -35,6 +40,18 @@
 // DBGDSCR's halting and monitor enables are left as they are (a halt request needs neither), and
 // the software lock is put back after the capture. A copy that faults stops there: in user mode
 // the DFSR and DFAR it sets belong to no exception in progress.
+//
+// Waits (waits=PID in the request, off by default): a PC sample sees only the threads that run,
+// so time a thread spends blocked is not in it. With waits, every thread of process PID that the
+// samples catch running is watched (up to WAIT_THREADS), and waitshz times a second each watched
+// thread's state is recorded whether it runs or not: its status, wait type and wait object
+// (ksceKernelGetThreadInfo), and while it is in a syscall the same frame a PC sample reads, read
+// through the thread's object: the syscall it blocked in and the user code that called it. A
+// blocked thread's kernel stack below that frame holds the syscall's own calls down to the wait:
+// the odd words there (Thumb return addresses) that fall in a kernel module's code are kept,
+// outermost first, so the kernel function that blocked is named too (a stack scan, not an
+// unwind: a stale word in a frame's padding can show up). Each wait object is named once, when
+// the capture first sees it.
 
 #include <psp2kern/io/dirent.h>
 #include <psp2kern/io/fcntl.h>
@@ -123,6 +140,25 @@ typedef struct Snapshot {
     uint32_t size; // stack bytes that follow (the copy stops at a fault)
 } Snapshot;
 
+typedef struct WaitSample {
+    uint32_t time; // ksceKernelGetSystemTimeLow, microseconds
+    uint32_t thid;
+    uint32_t status;    // SceThreadStatus (1 running, 2 ready, 8 waiting, ...); 0: not read
+    uint32_t wait_type; // SceKernelThreadInfo's, and its waitId
+    uint32_t wait_id;
+    uint32_t svc;       // SVC_FLAG | the syscall number, or 0
+    uint32_t user_pc;   // the user PC after the svc instruction
+    uint32_t user_lr;
+    uint32_t kcalls[8]; // waiting in a syscall: kernel return addresses below its frame, 0 after
+} WaitSample;
+
+#define WAIT_RING 32768u // wait samples, 2 MiB
+#define WAIT_THREADS 32u
+#define KCALLS 8u
+#define KSCAN 512u       // bytes of kernel stack scanned below a syscall frame
+#define KTEXT_MAX 256u   // kernel code segments
+#define WOBJ_MAX 64u     // wait objects named
+
 typedef struct Sample {
     uint32_t time;    // ksceKernelGetSystemTimeLow, microseconds
     uint32_t pc;
@@ -153,6 +189,21 @@ static volatile uint32_t stack_kernel, stack_busy, stack_no_halt, stack_no_step;
 #define STACK_SLOT (sizeof(Snapshot) + STACK_MAX)
 static SceUID sampler_thid = -1, last_sampler = -1, control_thid = -1;
 static Sample chunk[CHUNK];
+static SceUID wait_uid = -1;
+static WaitSample *wait_ring;
+static volatile uint32_t wait_head, wait_tail, wait_dropped;
+static uint32_t wait_pid, wait_every;
+static uint32_t watched_thid[WAIT_THREADS], watched_obj[WAIT_THREADS];
+static volatile uint32_t watched;
+static WaitSample wait_chunk[CHUNK];
+static uint32_t ktext_lo[KTEXT_MAX], ktext_hi[KTEXT_MAX], nktext; // sorted by ktext_lo
+typedef struct WaitObject {
+    uint32_t id, type;
+    int32_t result;
+    char name[32];
+} WaitObject;
+static WaitObject wait_objects[WOBJ_MAX];
+static uint32_t nwait_objects;
 static uint32_t threads[MAX_THREADS]; // open addressing, 0 empty
 static uint32_t pids[MAX_PIDS], npids;
 
@@ -169,24 +220,113 @@ static int mapped(uint32_t va) {
     return !(par & 1u);
 }
 
-static void syscall_frame(uint32_t cpu, Sample *s) {
-    s->svc = s->user_pc = s->user_lr = 0;
-    const uint32_t thread = *(volatile const uint32_t *)(cpucb + cpu * CPUCB_STRIDE + CPUCB_THREAD);
+// The syscall frame of the thread whose object is at `thread`: its number and the user PC and
+// LR, or zeros when it is not in a syscall. Returns the frame's address (0: none).
+static uint32_t thread_frame(uint32_t thread, uint32_t *svc, uint32_t *user_pc,
+                             uint32_t *user_lr) {
+    *svc = *user_pc = *user_lr = 0;
     if (!thread || !mapped(thread + THREAD_SVC_FRAME)) {
-        return;
+        return 0;
     }
     const uint32_t frame = *(volatile const uint32_t *)(uintptr_t)(thread + THREAD_SVC_FRAME);
     if (!frame || (frame & 3u) || !mapped(frame) || !mapped(frame + FRAME_SIZE - 4)) {
-        return;
+        return 0;
     }
     const volatile uint32_t *f = (const volatile uint32_t *)(uintptr_t)frame;
     const uint32_t number = f[FRAME_R12 / 4];
     if (number >= 0x1000u) {
-        return;
+        return 0;
     }
-    s->user_lr = f[FRAME_LR / 4];
-    s->user_pc = f[FRAME_PC / 4];
-    s->svc = SVC_FLAG | number;
+    *user_lr = f[FRAME_LR / 4];
+    *user_pc = f[FRAME_PC / 4];
+    *svc = SVC_FLAG | number;
+    return frame;
+}
+
+static int in_kernel_text(uint32_t va) {
+    uint32_t lo = 0, hi = nktext;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (va < ktext_lo[mid]) {
+            hi = mid;
+        } else if (va >= ktext_hi[mid]) {
+            lo = mid + 1;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// A blocked thread's kernel stack from its syscall frame down KSCAN bytes: the odd words in a
+// kernel module's code (Thumb return addresses), outermost first, into calls (0 after the last).
+static void kernel_calls(uint32_t frame, uint32_t *calls) {
+    uint32_t n = 0, page = 0;
+    for (uint32_t a = frame - 4; frame && a >= frame - KSCAN && n < KCALLS; a -= 4) {
+        if ((a & ~0xFFFu) != page) {
+            if (!mapped(a)) {
+                break;
+            }
+            page = a & ~0xFFFu;
+        }
+        const uint32_t w = *(volatile const uint32_t *)(uintptr_t)a;
+        if ((w & 1u) && in_kernel_text(w)) {
+            calls[n++] = w;
+        }
+    }
+    while (n < KCALLS) {
+        calls[n++] = 0;
+    }
+}
+
+static void syscall_frame(uint32_t cpu, Sample *s) {
+    const uint32_t thread = *(volatile const uint32_t *)(cpucb + cpu * CPUCB_STRIDE + CPUCB_THREAD);
+    thread_frame(thread, &s->svc, &s->user_pc, &s->user_lr);
+}
+
+// A thread of the watched process caught running on `cpu`: watched from now on (its object as
+// the per-CPU block names it), while there is room.
+static void watch(uint32_t cpu, uint32_t thid) {
+    const uint32_t n = watched;
+    for (uint32_t i = 0; i < n; i++) {
+        if (watched_thid[i] == thid) {
+            return;
+        }
+    }
+    if (n < WAIT_THREADS) {
+        watched_thid[n] = thid;
+        watched_obj[n] = *(volatile const uint32_t *)(cpucb + cpu * CPUCB_STRIDE + CPUCB_THREAD);
+        watched = n + 1;
+    }
+}
+
+// Each watched thread's state now, running or not.
+static void sample_waits(uint32_t now) {
+    const uint32_t n = watched;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t h = wait_head;
+        if (h - wait_tail >= WAIT_RING) {
+            wait_dropped++;
+            continue;
+        }
+        WaitSample *w = &wait_ring[h & (WAIT_RING - 1)];
+        w->time = now;
+        w->thid = watched_thid[i];
+        SceKernelThreadInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (ksceKernelGetThreadInfo(watched_thid[i], &info) >= 0) {
+            w->status = info.status;
+            w->wait_type = info.waitType;
+            w->wait_id = info.waitId;
+        } else {
+            w->status = w->wait_type = w->wait_id = 0;
+        }
+        const uint32_t frame = thread_frame(watched_obj[i], &w->svc, &w->user_pc, &w->user_lr);
+        kernel_calls(w->status == 8 ? frame : 0, w->kcalls);
+        asm volatile("dmb" ::: "memory");
+        wait_head = h + 1;
+    }
 }
 
 // Debug state through core `cpu`'s debug block: each step polls a bounded number of times, and a
@@ -378,11 +518,17 @@ static int sampler(SceSize args, void *argp) {
             } else {
                 s->svc = s->user_pc = s->user_lr = 0;
             }
+            if (wait_pid && s->pid == wait_pid && s->thid) {
+                watch(cpu, s->thid);
+            }
             asm volatile("dmb" ::: "memory");
             head = h + 1;
             if (stack_bytes && stack_mask & (1u << cpu) && seq % stack_every == 0) {
                 snapshot(cpu, now, s->thid, s->pid);
             }
+        }
+        if (wait_pid && seq % wait_every == 0) {
+            sample_waits(now);
         }
         seq++;
         ksceKernelDelayThread(period_us);
@@ -458,7 +604,7 @@ static uint32_t open_stacks(uint32_t mask) {
 }
 
 static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t stack_hz,
-                         uint32_t stack_cores) {
+                         uint32_t stack_cores, uint32_t waits, uint32_t waits_hz) {
     if (!cpucb && !(cpucb = find_cpucb())) {
         ksceKernelPrintf("[psp2prof] SceKernelThreadMgr's per-CPU blocks not found (not 3.65?)\n");
         return -1;
@@ -506,8 +652,26 @@ static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t s
         }
         stack_ring = base;
     }
+    if (waits && wait_uid < 0) {
+        void *base = NULL;
+        wait_uid = ksceKernelAllocMemBlock("psp2prof_waits", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
+                                           WAIT_RING * sizeof(WaitSample), NULL);
+        if (wait_uid < 0)
+            wait_uid = ksceKernelAllocMemBlock("psp2prof_waits", 0x1080d006,
+                                               WAIT_RING * sizeof(WaitSample), NULL);
+        if (wait_uid < 0 || ksceKernelGetMemBlockBase(wait_uid, &base) < 0) {
+            ksceKernelPrintf("[psp2prof] the wait ring failed: 0x%08X\n", wait_uid);
+            wait_uid = -1;
+            return -1;
+        }
+        wait_ring = base;
+    }
     head = tail = dropped = 0;
     stack_head = stack_tail = stack_dropped = 0;
+    wait_head = wait_tail = wait_dropped = 0;
+    watched = 0;
+    wait_pid = waits;
+    wait_every = waits ? (hz / waits_hz ? hz / waits_hz : 1u) : 1u;
     stack_kernel = stack_busy = stack_no_halt = stack_no_step = 0;
     period_us = 1000000u / hz;
     core_mask = cores;
@@ -610,6 +774,98 @@ static int drain_stacks(SceUID fd, uint32_t *count) {
     return 0;
 }
 
+// A wait object's name through its kind's Get*Info call (wait types as SceKernelThreadInfo
+// gives them on 3.65; bit 31 is the callback flag). Every info structure starts with its size,
+// the object's UID and a 32-byte name.
+static void name_object(WaitObject *o) {
+    union {
+        struct {
+            SceSize size;
+            SceUID id;
+            char name[32];
+        } head;
+        uint8_t raw[0x40];
+    } info;
+    memset(&info, 0, sizeof(info));
+    switch (o->type & 0x7FFFFFFFu) {
+    case 0x10:
+        info.head.size = sizeof(SceKernelEventFlagInfo);
+        o->result = ksceKernelGetEventFlagInfo(o->id, (SceKernelEventFlagInfo *)&info);
+        break;
+    case 0x20:
+        info.head.size = sizeof(SceKernelSemaInfo);
+        o->result = ksceKernelGetSemaInfo(o->id, (SceKernelSemaInfo *)&info);
+        break;
+    case 0x40:
+        info.head.size = sizeof(SceKernelMutexInfo);
+        o->result = ksceKernelGetMutexInfo(o->id, (SceKernelMutexInfo *)&info);
+        break;
+    case 0x40000:
+        info.head.size = sizeof(SceKernelMsgPipeInfo);
+        o->result = ksceKernelGetMsgPipeInfo(o->id, (SceKernelMsgPipeInfo *)&info);
+        break;
+    case 0x100000:
+        info.head.size = sizeof(SceKernelLwMutexInfo);
+        o->result = ksceKernelGetLwMutexInfo(o->id, (SceKernelLwMutexInfo *)&info);
+        break;
+    case 0x200000:
+        info.head.size = sizeof(SceKernelLwCondInfo);
+        o->result = ksceKernelGetLwCondInfo(o->id, (SceKernelLwCondInfo *)&info);
+        break;
+    default:
+        o->result = (int32_t)0x80020001;
+        return;
+    }
+    if (o->result >= 0) {
+        memcpy(o->name, info.head.name, sizeof(o->name) - 1);
+    }
+}
+
+// A waiting sample's object, named the first time (in the capture's thread, not the sampler's).
+static void note_object(const WaitSample *w) {
+    if (w->status != 8 || !w->wait_id || w->wait_id == 0xFFFFFFFFu) {
+        return;
+    }
+    for (uint32_t i = 0; i < nwait_objects; i++) {
+        if (wait_objects[i].id == w->wait_id && wait_objects[i].type == w->wait_type) {
+            return;
+        }
+    }
+    if (nwait_objects < WOBJ_MAX) {
+        WaitObject *o = &wait_objects[nwait_objects++];
+        memset(o, 0, sizeof(*o));
+        o->id = w->wait_id;
+        o->type = w->wait_type;
+        name_object(o);
+    }
+}
+
+// Moves the wait samples into WAIT records.
+static int drain_waits(SceUID fd, uint32_t *count) {
+    static uint32_t filled;
+    const uint32_t h = wait_head;
+    while (wait_tail != h) {
+        wait_chunk[filled++] = wait_ring[wait_tail & (WAIT_RING - 1)];
+        note_object(&wait_chunk[filled - 1]);
+        wait_tail++;
+        if (filled == CHUNK) {
+            if (put(fd, "WAIT", wait_chunk, sizeof(wait_chunk)) < 0) {
+                return -1;
+            }
+            *count += filled;
+            filled = 0;
+        }
+    }
+    if (!sampling && filled) {
+        if (put(fd, "WAIT", wait_chunk, filled * sizeof(WaitSample)) < 0) {
+            return -1;
+        }
+        *count += filled;
+        filled = 0;
+    }
+    return 0;
+}
+
 // Moves what the sampler left in the ring into SMPL records.
 static int drain(SceUID fd, uint32_t *count) {
     static uint32_t filled;
@@ -641,8 +897,12 @@ static int drain(SceUID fd, uint32_t *count) {
 typedef int (*GetModuleList)(SceUID pid, int flags1, int flags2, SceUID *modids, SceSize *num);
 typedef int (*GetModuleInfo)(SceUID pid, SceUID modid, SceKernelModuleInfo *info);
 
-// SceModulemgrForKernel's GetModuleList and GetModuleInfo through taiHEN (3.63+ NIDs).
-static void write_modules(SceUID fd, uint32_t pid) {
+typedef void (*SegmentFn)(SceUID fd, uint32_t pid, const SceKernelModuleInfo *info,
+                          uint32_t seg);
+
+// Each segment of each of pid's modules, through SceModulemgrForKernel's GetModuleList and
+// GetModuleInfo (taiHEN, 3.63+ NIDs).
+static void each_segment(SceUID fd, uint32_t pid, SegmentFn fn) {
     uintptr_t list = 0, get = 0;
     if (module_get_export_func(KERNEL_PID, "SceKernelModulemgr", 0x92C9FFC2, 0xB72C75A4, &list) < 0 ||
         module_get_export_func(KERNEL_PID, "SceKernelModulemgr", 0x92C9FFC2, 0xDAA90093, &get) < 0) {
@@ -661,26 +921,51 @@ static void write_modules(SceUID fd, uint32_t pid) {
             continue;
         }
         for (uint32_t seg = 0; seg < 4; seg++) {
-            if (!info.segments[seg].memsz) {
-                continue;
+            if (info.segments[seg].memsz) {
+                fn(fd, pid, &info, seg);
             }
-            struct {
-                uint32_t pid, vaddr, memsz, perms;
-                char name[28];
-            } rec;
-            memset(&rec, 0, sizeof(rec));
-            rec.pid = pid;
-            rec.vaddr = (uint32_t)(uintptr_t)info.segments[seg].vaddr;
-            rec.memsz = info.segments[seg].memsz;
-            rec.perms = info.segments[seg].perms | seg << 8;
-            memcpy(rec.name, info.module_name, sizeof(rec.name) - 1);
-            put(fd, "MODL", &rec, sizeof(rec));
         }
     }
 }
 
+static void put_segment(SceUID fd, uint32_t pid, const SceKernelModuleInfo *info, uint32_t seg) {
+    struct {
+        uint32_t pid, vaddr, memsz, perms;
+        char name[28];
+    } rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.pid = pid;
+    rec.vaddr = (uint32_t)(uintptr_t)info->segments[seg].vaddr;
+    rec.memsz = info->segments[seg].memsz;
+    rec.perms = info->segments[seg].perms | seg << 8;
+    memcpy(rec.name, info->module_name, sizeof(rec.name) - 1);
+    put(fd, "MODL", &rec, sizeof(rec));
+}
+
+static void write_modules(SceUID fd, uint32_t pid) {
+    each_segment(fd, pid, put_segment);
+}
+
+// A kernel code segment into the sorted table kernel_calls searches.
+static void note_text(SceUID fd, uint32_t pid, const SceKernelModuleInfo *info, uint32_t seg) {
+    (void)fd;
+    (void)pid;
+    if (!(info->segments[seg].perms & 1u) || nktext == KTEXT_MAX) {
+        return;
+    }
+    const uint32_t lo = (uint32_t)(uintptr_t)info->segments[seg].vaddr;
+    uint32_t i = nktext++;
+    for (; i && ktext_lo[i - 1] > lo; i--) {
+        ktext_lo[i] = ktext_lo[i - 1];
+        ktext_hi[i] = ktext_hi[i - 1];
+    }
+    ktext_lo[i] = lo;
+    ktext_hi[i] = lo + info->segments[seg].memsz;
+}
+
 static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stack,
-                    uint32_t stack_hz, uint32_t stack_cores, const char *name) {
+                    uint32_t stack_hz, uint32_t stack_cores, uint32_t waits, uint32_t waits_hz,
+                    const char *name) {
     char part[96], done[96];
     snprintf(part, sizeof(part), DIR "%s.part", name);
     snprintf(done, sizeof(done), DIR "%s.p2pf", name);
@@ -692,9 +977,14 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
     memset(threads, 0, sizeof(threads));
     npids = 0;
     note_pid(KERNEL_PID);
-    const int auth = start_sampler(hz, cores, stack, stack_hz, stack_cores);
+    nwait_objects = 0;
+    if (waits) {
+        nktext = 0;
+        each_segment(-1, KERNEL_PID, note_text);
+    }
+    const int auth = start_sampler(hz, cores, stack, stack_hz, stack_cores, waits, waits_hz);
     const uint32_t header[8] = {0x46503250, 1, hz, cores, (uint32_t)auth, 0, 0, 0}; // P2PF
-    uint32_t count = 0, stacks = 0;
+    uint32_t count = 0, stacks = 0, waited = 0;
     out_len = 0;
     out_failed = 0;
     emit(fd, header, sizeof(header));
@@ -702,16 +992,29 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
     const uint32_t start = ksceKernelGetSystemTimeLow();
     while (!failed && !unloading && ksceKernelGetSystemTimeLow() - start < seconds * 1000000u) {
         ksceKernelDelayThread(20000);
-        failed = drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0;
+        failed = drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0 ||
+                 drain_waits(fd, &waited) < 0;
     }
     stop_sampler();
-    failed = failed || drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0;
+    failed = failed || drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0 ||
+             drain_waits(fd, &waited) < 0;
     const uint32_t lost = dropped;
     put(fd, "DROP", &lost, sizeof(lost));
     if (stack) {
         const uint32_t sdrp[5] = {stack_dropped, stack_kernel, stack_busy, stack_no_halt,
                                   stack_no_step};
         put(fd, "SDRP", sdrp, sizeof(sdrp));
+    }
+    if (waits) {
+        const uint32_t wdrp[2] = {wait_dropped, watched};
+        put(fd, "WDRP", wdrp, sizeof(wdrp));
+        for (uint32_t i = 0; i < nwait_objects; i++) {
+            put(fd, "WOBJ", &wait_objects[i], sizeof(wait_objects[i]));
+        }
+        // The watched threads' names too, whether or not a sample caught them in the end.
+        for (uint32_t i = 0; i < watched; i++) {
+            note_thread(watched_thid[i]);
+        }
     }
     for (uint32_t i = 0; i < MAX_THREADS; i++) {
         if (!threads[i]) {
@@ -757,6 +1060,15 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
                          done, stacks, stack_dropped, stack_kernel, stack_busy, stack_no_halt,
                          stack_no_step);
     }
+    if (waits) {
+        ksceKernelPrintf("[psp2prof] %s: %u wait samples of %u threads, %u dropped; %u wait "
+                         "objects, %u kernel code segments\n",
+                         done, waited, watched, wait_dropped, nwait_objects, nktext);
+        if (!watched) {
+            ksceKernelPrintf("[psp2prof] no sample caught a thread of process 0x%X running: are "
+                             "its threads another process's?\n", waits);
+        }
+    }
 }
 
 static uint32_t number(const char *text) {
@@ -778,11 +1090,12 @@ static uint32_t number(const char *text) {
     }
 }
 
-// "seconds=S hz=H cores=MASK name=NAME" (defaults 4, 1000, 0x7, capture), and for stacks
-// "stack=BYTES stackhz=H stackcores=MASK" (defaults 0: none, 100, the cores); a name keeps
-// [A-Za-z0-9._-] only.
+// "seconds=S hz=H cores=MASK name=NAME" (defaults 4, 1000, 0x7, capture), for stacks
+// "stack=BYTES stackhz=H stackcores=MASK" (defaults 0: none, 100, the cores), and for waits
+// "waits=PID waitshz=H" (defaults 0: none, 200); a name keeps [A-Za-z0-9._-] only.
 static void request(char *text) {
     uint32_t seconds = 4, hz = 1000, cores = 0x7, stack = 0, stack_hz = 100, stack_cores = 0;
+    uint32_t waits = 0, waits_hz = 200;
     char name[48] = "capture";
     for (char *p = text; *p;) {
         while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') {
@@ -800,6 +1113,10 @@ static void request(char *text) {
             stack_hz = number(p + 8);
         } else if (!strncmp(p, "stackcores=", 11)) {
             stack_cores = number(p + 11);
+        } else if (!strncmp(p, "waits=", 6)) {
+            waits = number(p + 6);
+        } else if (!strncmp(p, "waitshz=", 8)) {
+            waits_hz = number(p + 8);
         } else if (!strncmp(p, "name=", 5)) {
             uint32_t n = 0;
             for (const char *q = p + 5; *q && n < sizeof(name) - 1; q++) {
@@ -819,9 +1136,11 @@ static void request(char *text) {
     stack_cores = stack_cores ? stack_cores : cores;
     if (!seconds || seconds > 600 || hz < 10 || hz > 10000 || !cores || cores > 0xF || !name[0] ||
         (stack && (stack < 64 || stack > STACK_MAX || stack % 256 || !stack_hz || stack_hz > hz ||
-                   stack_cores & ~cores & 0xFu || stack_cores & 8u))) {
+                   stack_cores & ~cores & 0xFu || stack_cores & 8u)) ||
+        (waits && (!waits_hz || waits_hz > hz))) {
         ksceKernelPrintf("[psp2prof] refused: seconds 1..600, hz 10..10000, cores 0x1..0xF; stack "
-                         "256..%u in 256s, stackhz 1..hz, stackcores within cores, not core 3\n",
+                         "256..%u in 256s, stackhz 1..hz, stackcores within cores, not core 3; "
+                         "waitshz 1..hz\n",
                          STACK_MAX);
         return;
     }
@@ -831,7 +1150,11 @@ static void request(char *text) {
         ksceKernelPrintf("[psp2prof] with stacks: %u bytes at %u Hz, cores 0x%X\n", stack, stack_hz,
                          stack_cores);
     }
-    capture(seconds, hz, cores, stack, stack_hz, stack_cores, name);
+    if (waits) {
+        ksceKernelPrintf("[psp2prof] with waits: process 0x%X's threads at %u Hz\n", waits,
+                         waits_hz);
+    }
+    capture(seconds, hz, cores, stack, stack_hz, stack_cores, waits, waits_hz, name);
 }
 
 static int control(SceSize args, void *argp) {
@@ -888,6 +1211,9 @@ int module_stop(SceSize args, void *argp) {
     }
     if (stack_uid >= 0) {
         ksceKernelFreeMemBlock(stack_uid);
+    }
+    if (wait_uid >= 0) {
+        ksceKernelFreeMemBlock(wait_uid);
     }
     if (dbg_uid >= 0) {
         ksceKernelFreeMemBlock(dbg_uid);

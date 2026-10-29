@@ -12,6 +12,14 @@ The plugin reports on the Vita's kernel TTY ([psp2prof] lines, devkit_console.py
 --stack BYTES also takes user-mode stacks: --stack-hz times a second the plugin halts each core
 in --stack-cores through its debug block for its registers and BYTES from its SP (whatever the
 core runs, interrupts masked or not), then restarts it. unwind_snapshots.py --p2pf unwinds them.
+
+--waits PID also reads the states of that process's threads, running or not: a PC sample sees
+only the threads that run, so a blocked thread's time is not in it. Every thread of PID that a
+sample catches running is watched, and --waits-hz times a second each one's status, wait type
+and object are read, with the syscall it is in and the user code that called it, and for a
+blocked thread the kernel calls below that syscall's frame (Thumb return addresses into kernel
+modules' code, a stack scan); each object waited on is named. waits.py reports them. A thread
+another process created is that process's: give the PID the samples show for it.
 """
 import argparse
 import sys
@@ -33,6 +41,10 @@ def main():
     parser.add_argument('--stack-hz', type=int, default=100, help='snapshots a second per core')
     parser.add_argument('--stack-cores', type=lambda v: int(v, 0), default=0,
                         help='cores to snapshot (default: --cores; never core 3)')
+    parser.add_argument('--waits', type=lambda v: int(v, 0), default=0,
+                        help="a process ID: its threads' states, running or blocked, read "
+                             '--waits-hz times a second (profile/waits.py reports them)')
+    parser.add_argument('--waits-hz', type=int, default=200, help='state reads a second (1..--hz)')
     parser.add_argument('--timeout', type=float, default=30.0,
                         help='seconds past the capture to wait for its file')
     args = parser.parse_args()
@@ -44,7 +56,9 @@ def main():
     pending = directory / 'request.tmp'
     stack = (f' stack={args.stack} stackhz={args.stack_hz} stackcores={args.stack_cores or args.cores:#x}'
              if args.stack else '')
-    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x}{stack} name={args.name}\n')
+    waits = f' waits={args.waits:#x} waitshz={args.waits_hz}' if args.waits else ''
+    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x}{stack}{waits} '
+                       f'name={args.name}\n')
     pending.rename(request)
     end = time.monotonic() + args.seconds + args.timeout
     while time.monotonic() < end:

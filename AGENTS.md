@@ -245,14 +245,17 @@ Text:
 | Question | Tools | Output |
 |---|---|---|
 | Where does the whole system spend its time: every core, the kernel, syscalls under their callers? | `psp2prof.py` (launch `PSP2PROF0` first in the same boot) | `HOST0/psp2prof/NAME.p2pf` |
+| Where are a process's threads blocked, on which object, in which syscall? | `psp2prof.py --waits PID`, `waits.py` | `HOST0/psp2prof/NAME.p2pf` |
 | Which functions of the app are hot, per thread? | `vita_prof.py` (Sony's DTrace; nothing to install) | `OUT.txt`, `OUT.samples` |
 | Who calls them (inclusive cost)? | `vita_prof.py --registers --stack-bytes 2048` | `OUT.register-info.json`, `.registers.jsonl`, `.stack.bin` |
 
 What each one misses:
 
 - psp2prof's sampler runs on core 3, so the default mask `--cores 0x7` covers cores 0-2: a
-  thread pinned to core 3 needs DTrace. It takes no call stacks. Its ring holds 65536
-  samples; a capture that outruns the host0: writes reports them as `dropped`.
+  thread pinned to core 3 needs DTrace. Its PC samples see running threads only: blocked
+  time needs `--waits`. Call stacks need `--stack`, which halts the cores it copies (their
+  shares shift). Its ring holds 65536 samples; a capture that outruns the host0: writes
+  reports them as `dropped`.
 - DTrace samples from each core's timer interrupt: a core with interrupts masked is never
   sampled, and kernel samples are bare PCs (`[kernel]` in the report). Use it for one
   process's code and its stacks.
@@ -277,7 +280,8 @@ RUN='60=python3 $TOOLS/profile/psp2prof.py $HOST0 --seconds 4 --name sys' \
 - It reports on the kernel TTY:
   - `[psp2prof] ready: waiting for host0:/psp2prof/request` after loading;
   - `capturing NAME: S s at H Hz, cores 0x7` when a capture starts;
-  - `host0:/psp2prof/NAME.p2pf: N samples, M dropped, P processes` when it ends.
+  - `host0:/psp2prof/NAME.p2pf: N samples, M dropped, P processes` when it ends, and with
+    `--waits` a line of wait samples, watched threads and named wait objects.
 - `--seconds` takes 1..600 and `--hz` 10..10000 (default 1000).
 
 One process, flat:
@@ -372,6 +376,19 @@ hotspot runs/sys/sys.perf.data
   (`MODULE+OFFSET` blocks) and the kernel.
 - A syscall's sample carries the user PC that made it as its callchain, so kernel time
   appears under its caller in hotspot's caller view.
+
+psp2prof, blocked time (`--waits PID`):
+
+```
+python3 profile/waits.py $HOST0/psp2prof/sys.p2pf --elf runs/APP.elf [--kelf MODULE=MODULE.elf]
+```
+
+- Per thread of PID: the share of reads that found it running, ready or waiting, then its
+  waits by object (wait type and name), syscall, the kernel calls below the syscall's frame
+  and the user code that made the syscall. `--kelf` symbolizes a kernel module you have the
+  ELF of (a plugin of yours).
+- PID is the process that created the threads. Run without wait samples, `waits.py` lists
+  each sampled thread's pid.
 - If the app's samples stay hex, its module name on the Vita differs from the ELF's file
   name: pass `--module NAME`.
 

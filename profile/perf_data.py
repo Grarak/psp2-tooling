@@ -153,6 +153,9 @@ def convert(rows, stacks, elf: Path, pid: int, base: int, hz: int, names: dict, 
 
 
 P2PF_SAMPLE = struct.Struct('<8I')  # time, pc, thid, pid, cpu | seq << 2, svc, user pc, user lr
+# time, thid, status, wait type, wait id, svc, user pc, user lr, then 8 kernel return
+# addresses below the syscall frame, 0 after the last (psp2prof waits=PID)
+P2PF_WAIT = struct.Struct('<16I')
 KERNEL_PID = 0x10005
 BLOCK = 128
 
@@ -163,7 +166,8 @@ def read_p2pf(path: Path):
     if magic != b'P2PF' or version != 1:
         raise ValueError(f'{path}: not a psp2prof capture')
     capture = dict(hz=hz, cores=cores, auth=auth, samples=[], threads={}, dropped=0,
-                   modules=collections.defaultdict(list), complete=False)
+                   modules=collections.defaultdict(list), complete=False, waits=[],
+                   wait_dropped=0, watched=0, wait_objects={})
     at = 32
     while at + 8 <= len(data):
         tag, size = struct.unpack_from('<4sI', data, at)
@@ -173,6 +177,15 @@ def read_p2pf(path: Path):
             capture['samples'].extend(P2PF_SAMPLE.iter_unpack(payload))
         elif tag == b'DROP':
             capture['dropped'] += struct.unpack_from('<I', payload)[0]
+        elif tag == b'WAIT':
+            capture['waits'].extend(P2PF_WAIT.iter_unpack(payload))
+        elif tag == b'WDRP':
+            capture['wait_dropped'], capture['watched'] = struct.unpack_from('<2I', payload)
+        elif tag == b'WOBJ':
+            # wait id, wait type -> (result of the Get*Info call, name)
+            wait_id, wait_type, result = struct.unpack_from('<IIi', payload)
+            capture['wait_objects'][(wait_id, wait_type)] = (
+                result, payload[12:44].split(b'\0')[0].decode(errors='replace'))
         elif tag == b'THRD':
             thid, pid = struct.unpack_from('<II', payload)
             capture['threads'][thid] = (pid, payload[8:40].split(b'\0')[0].decode(errors='replace'))
