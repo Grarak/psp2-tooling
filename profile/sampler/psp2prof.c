@@ -10,9 +10,11 @@
 // cores 0-2.
 //
 // Loaded once a boot (the PSP2PROF0 app, loader.c), it polls host0:psp2prof/request. A request is one line,
-// "seconds=S hz=H cores=MASK name=NAME" (profile/psp2prof.py writes it); the capture streams to
+// "seconds=S hz=H cores=MASK name=NAME" (profile/psp2prof.py writes it); the capture goes to
 // host0:psp2prof/NAME.part, renamed to NAME.p2pf once complete. profile/perf_data.py turns it
-// into perf.data.
+// into perf.data. The rings hold it until the window ends (a host0: write stalls the profiled
+// app's own host0: I/O for its USB round trip); only stack snapshots, and a ring that fills, are
+// written during the window.
 //
 // Capture file, little endian: "P2PF", version 1, hz, core mask, DBGAUTHSTATUS, 3 reserved
 // words; then records of a 4-byte tag, a u32 size and the payload padded to 4 bytes:
@@ -693,12 +695,15 @@ static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t s
 // The capture goes out in 64 KiB writes: each host0: write is a round trip over USB (about
 // 0.1 s from the kernel, whatever its size).
 static uint8_t out[64 * 1024];
-static uint32_t out_len;
+static uint32_t out_len, window_bytes;
 static int out_failed;
 
 static void flush(SceUID fd) {
     if (out_len && !out_failed && ksceIoWrite(fd, out, out_len) != (int)out_len) {
         out_failed = 1;
+    }
+    if (sampling) {
+        window_bytes += out_len;
     }
     out_len = 0;
 }
@@ -894,6 +899,23 @@ static int drain(SceUID fd, uint32_t *count) {
     return 0;
 }
 
+// The drains during the window. A host0: write holds host0:'s file lock for its USB round trip
+// (about 0.2 s for 64 KiB, measured 2026-10-29), stalling the profiled app's own host0: I/O
+// behind it, so the rings keep the capture until the window ends and only one 3/4 full is
+// drained early. Stack snapshots (STACK_RING slots) are written as they come all the same.
+static int drain_window(SceUID fd, uint32_t *count, uint32_t *stacks, uint32_t *waited) {
+    if (head - tail >= RING / 4 * 3 && drain(fd, count) < 0) {
+        return -1;
+    }
+    if (drain_stacks(fd, stacks) < 0) {
+        return -1;
+    }
+    if (wait_head - wait_tail >= WAIT_RING / 4 * 3 && drain_waits(fd, waited) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 typedef int (*GetModuleList)(SceUID pid, int flags1, int flags2, SceUID *modids, SceSize *num);
 typedef int (*GetModuleInfo)(SceUID pid, SceUID modid, SceKernelModuleInfo *info);
 
@@ -985,15 +1007,14 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
     const int auth = start_sampler(hz, cores, stack, stack_hz, stack_cores, waits, waits_hz);
     const uint32_t header[8] = {0x46503250, 1, hz, cores, (uint32_t)auth, 0, 0, 0}; // P2PF
     uint32_t count = 0, stacks = 0, waited = 0;
-    out_len = 0;
+    out_len = window_bytes = 0;
     out_failed = 0;
     emit(fd, header, sizeof(header));
     int failed = auth < 0;
     const uint32_t start = ksceKernelGetSystemTimeLow();
     while (!failed && !unloading && ksceKernelGetSystemTimeLow() - start < seconds * 1000000u) {
         ksceKernelDelayThread(20000);
-        failed = drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0 ||
-                 drain_waits(fd, &waited) < 0;
+        failed = drain_window(fd, &count, &stacks, &waited) < 0;
     }
     stop_sampler();
     failed = failed || drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0 ||
@@ -1052,8 +1073,8 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
         return;
     }
     ksceIoRename(part, done);
-    ksceKernelPrintf("[psp2prof] %s: %u samples, %u dropped, %u processes\n", done, count, lost,
-                     npids);
+    ksceKernelPrintf("[psp2prof] %s: %u samples, %u dropped, %u processes; %u KiB written during "
+                     "the window\n", done, count, lost, npids, window_bytes >> 10);
     if (stack) {
         ksceKernelPrintf("[psp2prof] %s: %u stacks, %u dropped; not taken: %u privileged, %u in "
                          "Debug state or powered down, %u halts and %u steps timed out\n",

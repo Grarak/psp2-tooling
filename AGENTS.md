@@ -254,8 +254,10 @@ What each one misses:
 - psp2prof's sampler runs on core 3, so the default mask `--cores 0x7` covers cores 0-2: a
   thread pinned to core 3 needs DTrace. Its PC samples see running threads only: blocked
   time needs `--waits`. Call stacks need `--stack`, which halts the cores it copies (their
-  shares shift). Its ring holds 65536 samples; a capture that outruns the host0: writes
-  reports them as `dropped`.
+  shares shift). Its rings hold the capture until the window ends, because each host0: write
+  stalls the app's own host0: I/O for about 0.2 s; a ring 3/4 full and stack snapshots are
+  written during the window (`KiB written during the window` on the TTY), and samples that
+  find a ring full are `dropped`.
 - DTrace samples from each core's timer interrupt: a core with interrupts masked is never
   sampled, and kernel samples are bare PCs (`[kernel]` in the report). Use it for one
   process's code and its stacks.
@@ -280,8 +282,9 @@ RUN='60=python3 $TOOLS/profile/psp2prof.py $HOST0 --seconds 4 --name sys' \
 - It reports on the kernel TTY:
   - `[psp2prof] ready: waiting for host0:/psp2prof/request` after loading;
   - `capturing NAME: S s at H Hz, cores 0x7` when a capture starts;
-  - `host0:/psp2prof/NAME.p2pf: N samples, M dropped, P processes` when it ends, and with
-    `--waits` a line of wait samples, watched threads and named wait objects.
+  - `host0:/psp2prof/NAME.p2pf: N samples, M dropped, P processes; K KiB written during the
+    window` when it ends, and with `--waits` a line of wait samples, watched threads and
+    named wait objects.
 - `--seconds` takes 1..600 and `--hz` 10..10000 (default 1000).
 
 One process, flat:
