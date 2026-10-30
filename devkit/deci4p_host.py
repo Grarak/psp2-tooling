@@ -562,6 +562,7 @@ class CtrlpClient:
         self.axes = [CTRLP_ANALOG_CENTRE] * 4
         self.contacts = []
         self.touch_open = False
+        self.touch_panel = 0  # the panel the open touch session's contacts are on
         self.play_open = False
         self.play_buttons = 0
         self.record_open = False
@@ -637,7 +638,8 @@ class CtrlpClient:
                 + entries)
 
     def touch(self, contacts, panel=0):
-        """Holds these contacts down; the Vita re-applies the last record every frame."""
+        """Holds these contacts down on `panel` (0 the front, 1 the rear); the Vita re-applies the
+        last record every frame."""
         if not self.touch_open:
             # Only the touch channel, so the physical pad keeps working.
             self.request(CTRLP_PLAY_START,
@@ -647,11 +649,12 @@ class CtrlpClient:
         self.request(CTRLP_PLAY_DATA,
                      struct.pack('<II', 1, 4) + self.touch_record(contacts, panel))
         self.contacts = list(contacts)
+        self.touch_panel = panel
 
     def untouch(self):
         if not self.touch_open:
             return
-        self.touch([])
+        self.touch([], self.touch_panel)
         self.request(CTRLP_PLAY_STOP)
         self.touch_open = False
         self.contacts = []
@@ -1253,8 +1256,10 @@ class TargetManager:
             if word[0] == 'playstop' and len(word) == 1:
                 self.ctrlp.play_stop()
                 return 'ok playstop'
-            if word[0] == 'touch' and len(word) in (3, 4):
-                # Screen coordinates; the panel grid is exactly twice the screen.
+            if word[0] in ('touch', 'backtouch') and len(word) in (3, 4):
+                # Screen coordinates; the panel grid is exactly twice the screen. The rear panel
+                # takes the same grid, which ctrlp clamps to its own active area (panelinfo 1).
+                panel = 1 if word[0] == 'backtouch' else 0
                 x, y = int(word[1], 0), int(word[2], 0)
                 force = int(word[3], 0) if len(word) == 4 else CTRLP_TOUCH_FORCE
                 if not 0 <= x <= CTRLP_PANEL_MAX_X // 2 or not 0 <= y <= CTRLP_PANEL_MAX_Y // 2:
@@ -1262,8 +1267,8 @@ class TargetManager:
                                      f'0..{CTRLP_PANEL_MAX_Y // 2}')
                 if not 0 < force <= 0xFF:
                     raise ValueError('FORCE must be in 1..255')
-                self.ctrlp.touch([(0, force, x * 2, y * 2)])
-                return f'ok touch {x} {y} force {force}'
+                self.ctrlp.touch([(0, force, x * 2, y * 2)], panel)
+                return f'ok {word[0]} {x} {y} force {force}'
             if word[0] == 'untouch' and len(word) == 1:
                 self.ctrlp.untouch()
                 return 'ok untouch'

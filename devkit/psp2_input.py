@@ -26,6 +26,7 @@ Commands:
                              a touch contact, so the pad half is the control
     playstop                 end that session and give the pad back
     touch X Y [FORCE]        one contact at screen coordinates, 0..959 by 0..543
+    backtouch X Y [FORCE]    the same on the rear panel (clamped to its active area)
     untouch                  lift it and give the panel back to the hardware
     panelinfo [PANEL]        ask ctrlp for its cached panel descriptor (0 or 1);
                              the reply body lands in the packet log
