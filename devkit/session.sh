@@ -140,7 +140,14 @@ boot() {
     python3 "$TOOLS/devkit/deci4p_host.py" --usb --host0 "$HOST0" --control "$SOCK" --log-dir "$OUT" \
         --log-name deci4p.log "${launch[@]}" > "$OUT/deci4p.out" 2>&1 &
     DECI=$!
+    local linked=$(date +%s)
     for i in $(seq 1 300); do [ -S "$SOCK" ] && break; sleep 0.1; done
+    if [ -z "${RETAIL:-}" ] && [ -z "${INSTALL:-}" ]; then
+        # A launch while the boot still starts its modules (~8 s after power-up) can stall it:
+        # the first launch comes 25 s after the link, as the promoter's does.
+        step "waiting for the boot"
+        while [ $(( $(date +%s) - linked )) -lt 25 ]; do sleep 1; done
+    fi
     if [ -n "${RETAIL:-}" ]; then
         # retail-cp loads the Target Manager services once the shell is up (about 15 s after a
         # reset): launch after LOADP (0x24000) is announced.
