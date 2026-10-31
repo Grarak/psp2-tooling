@@ -181,7 +181,9 @@ for launch in "$@"; do
     step "launch $n: $launch"
     replies=$(count 'LOADP reply')
     input "launch $launch" > /dev/null
-    for i in $(seq 1 50); do [ "$(count 'LOADP reply')" -gt "$replies" ] && break; sleep 0.1; done
+    # A title launch replies once SceAppMgr has started it: ~3 s on a booted Vita, longer while
+    # the boot's modules still start (the first launch comes ~10 s after power-up).
+    for i in $(seq 1 600); do [ "$(count 'LOADP reply')" -gt "$replies" ] && break; sleep 0.1; done
     reply=$(grep -a 'LOADP reply' "$DECI_LOG" | tail -1)
     echo "$reply"
     stopped=
