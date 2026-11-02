@@ -61,6 +61,7 @@ constexpr const char* CaptureModule = "ur0:data/librazorcapture_es4.suprx";
 // counter selects of SceRazorHud's four metric groups (its table at 0x8100d5b0); in every
 // group, selectsB bits 24, 25 and 26 are each core's vertex, fragment and firmware busy.
 constexpr uint32_t PaKey[2] = {0x7a207888, 0x7a207777};
+constexpr uintptr_t DevKitTraceWindow = 0x40000000;
 constexpr uint32_t GroupSelects[4][2] = {
     {0x00000000, 0x07014100}, {0x00000000, 0x07ff2929}, {0x1f000000, 0x070f1f1f}, {0x00000000, 0x07010100}};
 // The PA samples the SGX's performance counters, which are off until the driver gets
@@ -115,7 +116,7 @@ struct SceneRecord {
 };
 
 static_assert(sizeof(SceneRecord) == 216);
-constexpr unsigned MaxSceneRecords = 64;
+constexpr unsigned MaxSceneRecords = 2048;
 struct State {
   bool initialized = false, live = false, finished = false, hwperf = false;
   bool captureTriggered = false, captureBusy = false;
@@ -312,6 +313,36 @@ uint32_t trace_written() {
   return sceKernelPaGetWritePointer() - state.traceBase;
 }
 
+// The PA writes the trace by physical address, and sysmem lets it write only to a window of
+// physical memory. On a DevKit that window is mapped at user VA 0x40000000, which is where
+// SceRazorHud puts its trace (a user block fails with 0x80020005). A retail Vita has no such
+// mapping: retail-cp accepts a block from the PhyCont partition instead, which the CPU reads
+// back uncached.
+int setup_trace_buffer() {
+  SceKernelPaTraceBufferParam buffer{1, reinterpret_cast<void*>(DevKitTraceWindow), state.traceBytes, 0, 0};
+  int result = _sceKernelPaSetupTraceBufferByKey(state.paKey, &buffer);
+
+  if (result >= 0) {
+    state.trace = buffer.base;
+    return result;
+  }
+
+  state.traceBlock = sceKernelAllocMemBlock("razor_pa_trace", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, state.traceBytes, nullptr);
+  result = state.traceBlock;
+
+  if (result >= 0)
+    result = sceKernelGetMemBlockBase(state.traceBlock, &state.trace);
+
+  report(result, "allocate the PA trace buffer");
+
+  if (result >= 0) {
+    buffer.base = state.trace;
+    result = _sceKernelPaSetupTraceBufferByKey(state.paKey, &buffer);
+  }
+
+  return result;
+}
+
 bool begin_live() {
   state.output = sceIoOpen(state.livePath, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC | SCE_O_NOBUF, 0777);
 
@@ -332,19 +363,8 @@ bool begin_live() {
                     state.cpuTrace ? "native-owner-prepresent" : "disabled", state.sceneTrace ? "application draws; excludes driver internal work" : "disabled");
   record("META", metadata, unsigned(length));
 
-  // The PA writes the trace by physical address, and the CPU reads it back uncached.
-  state.traceBlock = sceKernelAllocMemBlock("razor_pa_trace", SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW, state.traceBytes, nullptr);
-  int result = state.traceBlock;
-
-  if (result >= 0)
-    result = sceKernelGetMemBlockBase(state.traceBlock, &state.trace);
-
-  report(result, "allocate the PA trace buffer");
-
-  if (result >= 0) {
-    result = sceKernelPaRegisterShared(PaKey[0], PaKey[1]);
-    report(result, "register with pamgr");
-  }
+  int result = sceKernelPaRegisterShared(PaKey[0], PaKey[1]);
+  report(result, "register with pamgr");
 
   if (result >= 0) {
     state.paKey = result;
@@ -364,8 +384,7 @@ bool begin_live() {
     state.hwperf = hwperf == 0;
     std::fprintf(stderr, "razor: switch the SGX performance counters on = %d (PVRSRV_ERROR, 0: ok)\n", hwperf);
     // SceRazorHud's order: the buffer, the GPU trace, both bookmark channels, then start.
-    const SceKernelPaTraceBufferParam buffer{1, state.trace, state.traceBytes, 0, 0};
-    result = _sceKernelPaSetupTraceBufferByKey(state.paKey, &buffer);
+    result = setup_trace_buffer();
     report(result, "set up the PA trace buffer");
     // Until the PA writes, the write pointer is the buffer's physical base.
     state.traceBase = sceKernelPaGetWritePointer();

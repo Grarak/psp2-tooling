@@ -13,9 +13,11 @@
 // Live metrics drive the Performance Analyzer through pamgr the way Sony's Razor HUD does,
 // without the HUD: the PA samples into the recorder's buffer for the whole window, which is
 // written out raw only when the window ends, and razor/rzlv.py turns the samples into
-// per-core TA/3D busy intervals offline. The HUD's 40 us sampling makes up to 4 MB/s, so the
-// buffer bounds the window (group 1: about 2 s per 8 MiB). pamgr is resident on a
-// DevKit; a retail Vita needs retail-cp, which loads it and accepts the recorder's buffer.
+// per-core TA/3D busy intervals offline, so the app runs at full speed during the window. The
+// HUD's 40 us sampling makes up to 4 MB/s, so the buffer bounds the window (group 1: about 2 s
+// per 8 MiB). pamgr is resident on a DevKit, whose PA takes only the window sysmem maps at
+// user VA 0x40000000, as the HUD does; a retail Vita needs retail-cp, which loads pamgr and
+// accepts a PhyCont block of the recorder's instead.
 //
 // Snapshots load librazorcapture_es4.suprx from ur0:data/; copy it there from DevKit firmware's
 // vs0:sys/external. A retail Vita rejects that encrypted SELF (0x800f0516): give it an fSELF of
@@ -29,7 +31,7 @@
 //   start=N          start after this many frame() calls (default 120)
 //   frames=N         frames to trace (default 120; 0: until stop()); a full buffer ends the
 //                    window early
-//   trace-mib=N      trace buffer in MiB, physically contiguous (default 8, at most 64)
+//   trace-mib=N      trace buffer in MiB (default 8, at most 64)
 //   scenes           scene records from scene_begin()/scene_draw()
 //   cpu              CPU wall spans from begin_cpu_work()/end_cpu_work() (one thread only)
 //   capture=PATH     .sgx snapshot of the frame after capture-frame=N (default 120); a
