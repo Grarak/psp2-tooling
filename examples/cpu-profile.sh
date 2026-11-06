@@ -17,3 +17,9 @@ HOST0=$1 OUT=run RUN='60=python3 $TOOLS/profile/psp2prof.py $HOST0 --seconds 4 -
 # --module: the app's module name on the Vita, when it differs from the ELF's file name.
 python3 $T/profile/perf_data.py "$1/psp2prof/app.p2pf" --elf "$3" --out run/app.perf.data
 hotspot run/app.perf.data    # or: perf report -i run/app.perf.data --sort comm,dso,sym
+# Call stacks too: add --stack 4096 --stack-cores 0x5 (cores 0 and 2, 100 Hz) to psp2prof.py,
+# then unwind them with the ELF's CFI. A snapshot stopped in Sony's sceClibMemcpy and the like
+# has no CFI there: leaf_callers.py starts it at its caller first (PID: the app's, from the
+# capture's threads).
+#   python3 $T/profile/leaf_callers.py "$3" --p2pf "$1/psp2prof/app.p2pf" PID --moved run/app-moved.p2pf
+#   python3 $T/profile/unwind_snapshots.py --p2pf run/app-moved.p2pf --pid PID --elf "$3" --out run/cfi

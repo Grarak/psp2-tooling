@@ -117,7 +117,7 @@ Don't remove retail-cp from the config by hand first: without it nothing can cle
 | `psp2prof.py` | Asks the loaded plugin for a capture over host0: and waits for it |
 | `vita_prof.py` | Sony's DTrace sampler over DECI4p: user and kernel PCs, or register and stack snapshots for call stacks |
 | `unwind_snapshots.py` | Unwinds `vita_prof.py`'s snapshots with the ELF's DWARF CFI (libdw); `arm32_cfi.py` and `elf32.py` are its parts |
-| `leaf_callers.py` | Callers of samples DWARF CFI cannot unwind: Sony's modules, asm memcpy/memset, divisions |
+| `leaf_callers.py` | Callers of samples DWARF CFI cannot unwind (Sony's modules, asm memcpy/memset, divisions), from DTrace or psp2prof snapshots; moves psp2prof's to their callers for `unwind_snapshots.py` |
 | `perf_data.py` | Turns psp2prof captures or DTrace samples (with stacks) into perf.data for hotspot and perf |
 
 Build an app you profile with `-g` and its SELF with `vita-make-fself -na` (`NOASLR` in
