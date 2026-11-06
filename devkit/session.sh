@@ -169,8 +169,16 @@ boot() {
 
 size() { stat -c %s "$OUT/$1" 2>/dev/null || echo 0; }
 slice() { tail -c +$(( $2 + 1 )) "$OUT/$1" > "$3/$1" 2>/dev/null; }
-# Whether the launched process's last LOADP event since the launch is its exit.
-exited() { tail -c +$(( d0 + 1 )) "$DECI_LOG" | grep -a 'LOADP process' | tail -1 | grep -q exited; }
+# Whether the launched title's last LOADP event since the launch is its exit: the reply's pid and
+# the processes it creates (a title that starts itself again in a child). Other processes come and
+# go (the shell starts one a few tens of seconds after a boot); without a pid, any process's.
+exited() {
+    tail -c +$(( d0 + 1 )) "$DECI_LOG" | grep -a 'LOADP process' | awk -v pid="${pid:-}" '
+        BEGIN { own[pid] = 1 }
+        $4 == "created" { if (pid == "" || ($6 in own)) { own[$7] = 1; last = "created" } }
+        $4 == "exited" || $4 == "killed" { if (pid == "" || ($6 in own)) last = $4 }
+        END { exit last == "exited" ? 0 : 1 }'
+}
 due() { [ $(( $(date +%s) - start )) -ge "$1" ]; }
 
 boot || exit 1
@@ -193,6 +201,7 @@ for launch in "$@"; do
     for i in $(seq 1 600); do [ "$(count 'LOADP reply')" -gt "$replies" ] && break; sleep 0.1; done
     reply=$(grep -a 'LOADP reply' "$DECI_LOG" | tail -1)
     echo "$reply"
+    pid=$(sed -n 's/.* pid \(0x[0-9a-f]*\).*/\1/p' <<< "$reply")
     stopped=
     case "$reply" in *"result 0x0 "*) ;; *) step "launch refused"; stopped=1 ;; esac
     start=$(date +%s)
