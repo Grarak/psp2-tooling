@@ -160,6 +160,37 @@ KERNEL_PID = 0x10005
 BLOCK = 128
 
 
+# Cortex-A9 PMU events (Technical Reference Manual r2p2, Performance Monitoring Unit: the
+# architectural events and the Cortex-A9's own), by number, for psp2prof's PMU counts.
+PMU_EVENT_NAMES = {
+    0x00: 'sw-incr', 0x01: 'l1i-refill', 0x02: 'itlb-refill', 0x03: 'l1d-refill',
+    0x04: 'l1d-access', 0x05: 'dtlb-refill', 0x06: 'loads', 0x07: 'stores',
+    0x09: 'exceptions', 0x0A: 'exception-returns', 0x0B: 'contextidr-writes',
+    0x0C: 'pc-writes', 0x0D: 'immediate-branches', 0x0F: 'unaligned', 0x10: 'branch-mispredicts',
+    0x11: 'cycles', 0x12: 'predictable-branches',
+    0x50: 'coherent-linefill-misses', 0x51: 'coherent-linefill-hits',
+    0x60: 'icache-stall-cycles', 0x61: 'dcache-stall-cycles', 0x62: 'tlb-miss-stall-cycles',
+    0x63: 'strex-passed', 0x64: 'strex-failed', 0x65: 'data-evictions',
+    0x66: 'issue-no-dispatch', 0x67: 'issue-empty', 0x68: 'instructions-renamed',
+    0x6E: 'predictable-returns', 0x70: 'main-unit-instructions', 0x71: 'second-unit-instructions',
+    0x72: 'load-store-instructions', 0x73: 'fp-instructions', 0x74: 'neon-instructions',
+    0x80: 'pld-stall-cycles', 0x81: 'write-stall-cycles', 0x82: 'itlb-main-stall-cycles',
+    0x83: 'dtlb-main-stall-cycles', 0x84: 'itlb-micro-stall-cycles',
+    0x85: 'dtlb-micro-stall-cycles', 0x86: 'dmb-stall-cycles', 0x8A: 'integer-clock-cycles',
+    0x8B: 'data-engine-clock-cycles', 0x90: 'isb', 0x91: 'dsb', 0x92: 'dmb',
+    0x93: 'external-interrupts',
+}
+PMU_EVENT_NUMBERS = {name: number for number, name in PMU_EVENT_NAMES.items()}
+# A PMUS record's entry: core | read sequence << 2 (as its SMPL sample's cpu word), the six event
+# counters, the cycle counter.
+P2PF_PMU = struct.Struct('<8I')
+
+
+def pmu_event(text):
+    """An event by name (PMU_EVENT_NAMES) or number (0x03, 3)."""
+    return PMU_EVENT_NUMBERS[text] if text in PMU_EVENT_NUMBERS else int(text, 0)
+
+
 def read_p2pf(path: Path):
     data = path.read_bytes()
     magic, version, hz, cores, auth = struct.unpack_from('<4sIIII', data)
@@ -167,7 +198,8 @@ def read_p2pf(path: Path):
         raise ValueError(f'{path}: not a psp2prof capture')
     capture = dict(hz=hz, cores=cores, auth=auth, samples=[], threads={}, dropped=0,
                    modules=collections.defaultdict(list), complete=False, waits=[],
-                   wait_dropped=0, watched=0, wait_objects={})
+                   wait_dropped=0, watched=0, wait_objects={}, pmu_events=[], pmu_cores=0,
+                   pmu=[], pmu_dropped=0, pmu_failed=0, snapshots=[])
     at = 32
     while at + 8 <= len(data):
         tag, size = struct.unpack_from('<4sI', data, at)
@@ -193,6 +225,17 @@ def read_p2pf(path: Path):
             pid, vaddr, memsz, perms = struct.unpack_from('<4I', payload)
             name = payload[16:44].split(b'\0')[0].decode(errors='replace')
             capture['modules'][pid].append((vaddr, memsz, perms, name))
+        elif tag == b'PMUC':
+            count, *events, mask = struct.unpack_from('<8I', payload)
+            capture['pmu_events'], capture['pmu_cores'] = events[:count], mask
+        elif tag == b'PMUS':
+            capture['pmu'].extend(P2PF_PMU.iter_unpack(payload))
+        elif tag == b'STAK':
+            # the snapshot's time and core (unwind_snapshots.py reads the rest)
+            when, _, _, cpu = struct.unpack_from('<4I', payload)
+            capture['snapshots'].append((when, cpu & 3))
+        elif tag == b'PDRP':
+            capture['pmu_dropped'], capture['pmu_failed'] = struct.unpack_from('<2I', payload)
         elif tag == b'END ':
             capture['complete'] = True
             break
