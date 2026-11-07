@@ -113,8 +113,9 @@ Don't remove retail-cp from the config by hand first: without it nothing can cle
 
 | Tool | What it does |
 |---|---|
-| `sampler/` | psp2prof: a taiHEN kernel plugin that samples every core's PC (CoreSight), its thread and process, and a syscall's user caller; `psp2prof.vpk` (PSP2PROF0) loads it |
-| `psp2prof.py` | Asks the loaded plugin for a capture over host0: and waits for it |
+| `sampler/` | psp2prof: a taiHEN kernel plugin that samples every core's PC (CoreSight), its thread and process, a syscall's user caller, and optionally its PMU counters; `psp2prof.vpk` (PSP2PROF0) loads it |
+| `psp2prof.py` | Asks the loaded plugin for a capture over host0: and waits for it; `--pmu` also counts up to six Cortex-A9 PMU events per core (cache refills, stall cycles, ...) next to each PC sample |
+| `pmu_attr.py` | Credits a `--pmu` capture's counts to the functions its PC samples landed in: rates per phase of a thread (cache refills and stall cycles per 1000 cycles) |
 | `vita_prof.py` | Sony's DTrace sampler over DECI4p: user and kernel PCs, or register and stack snapshots for call stacks |
 | `unwind_snapshots.py` | Unwinds `vita_prof.py`'s snapshots with the ELF's DWARF CFI (libdw); `arm32_cfi.py` and `elf32.py` are its parts |
 | `leaf_callers.py` | Callers of samples DWARF CFI cannot unwind (Sony's modules, asm memcpy/memset, divisions), from DTrace or psp2prof snapshots; moves psp2prof's to their callers for `unwind_snapshots.py` |
