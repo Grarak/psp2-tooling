@@ -16,6 +16,9 @@ million cycles), and its counts are everything the core ran in it: they tell apa
 thread that last longer than a period, not the functions called within one. Functions that run
 together in one phase come out with the same rates; sample one core faster (psp2prof.py --hz
 10000 --cores 0x4) for shorter periods. No period is short enough for single instructions.
+Periods are not all alike: the sampler shares its core, and a period that it was held up in
+carries more of what ran before its sample. --max-cycles leaves out the periods longer than
+that (a function whose periods run long shows it in its median period).
 
 A core waiting for an interrupt (WFI, the kernel's idle thread) answers every counter read with
 zero, and a core that enters or leaves WFI during the reads gives some counters and zeros for the
@@ -34,6 +37,7 @@ import argparse
 import bisect
 import collections
 import math
+import statistics
 import subprocess
 import sys
 from pathlib import Path
@@ -61,6 +65,7 @@ def main():
     parser.add_argument('--pid', type=lambda v: int(v, 0), help='only the periods of this process')
     parser.add_argument('--top', type=int, default=30)
     parser.add_argument('--raw-pc', action='store_true', help='the PC as DBGPCSR read it')
+    parser.add_argument('--max-cycles', type=int, help='leave out the periods longer than this')
     args = parser.parse_args()
 
     cap = read_p2pf(args.capture)
@@ -103,8 +108,9 @@ def main():
         snap_step = math.gcd(snap_step, seq)
     snap_cores = {c for _, c in cap['snapshots']}
     per = collections.defaultdict(lambda: [0] * (len(events) + 2))  # function -> samples, counts...
+    lengths = collections.defaultdict(list)  # function -> its periods' cycles
     totals = [0] * (len(events) + 2)
-    gaps = resets = unread = halted = 0
+    gaps = resets = unread = halted = long = 0
     for core, rows in by_core.items():
         rows.sort(key=lambda p: p[0] >> 2)
         counted = [n for n in range(1, len(events) + 1) if any(r[n] for r in rows)] + [7]
@@ -130,8 +136,12 @@ def main():
             if any(d >= 0x80000000 for d in delta):
                 resets += 1
                 continue
+            if args.max_cycles and delta[-1] > args.max_cycles:
+                long += 1
+                continue
             ip = ip_of(s[1])
             func = where(ip, s[3])
+            lengths[func].append(delta[-1])
             row = per[func]
             row[0] += 1
             totals[0] += 1
@@ -142,15 +152,17 @@ def main():
     cores = ', '.join(str(c) for c in sorted(by_core))
     print(f'{args.capture.name}: {totals[0]} periods credited (cores {cores}; left out: {gaps} after '
           f'a gap, {halted} with a stack snapshot, {unread} next to a read in WFI, {resets} with '
-          f'a counter reset; '
+          f'a counter reset, {long} longer than --max-cycles; '
           f'{cap["pmu_dropped"]} PMU samples dropped)')
     if not totals[0]:
         return
     cyc = totals[-1]
     print(f'in all: {cyc / totals[0]:.0f} cycles a period; ' + ', '.join(
         f'{names[n]} {totals[1 + n] / totals[0]:.1f}' for n in range(len(events))) + ' a period')
-    head = f"{'samples':>8} {'cycles%':>7} " + ' '.join(f'{nm[:14]:>14}' for nm in names[:-1])
-    print('\nper function: each counter as its share of the total, then per 1000 of its cycles')
+    head = (f"{'samples':>8} {'cycles%':>7} {'median':>7} " +
+            ' '.join(f'{nm[:14]:>14}' for nm in names[:-1]))
+    print('\nper function: its periods\' median cycles, each counter as its share of the total, '
+          'then per 1000 of its cycles')
     print(head + '  function')
     for func, row in sorted(per.items(), key=lambda kv: -kv[1][0])[:args.top]:
         cells = []
@@ -158,7 +170,8 @@ def main():
             share = 100 * row[1 + n] / totals[1 + n] if totals[1 + n] else 0
             rate = 1000 * row[1 + n] / row[-1] if row[-1] else 0
             cells.append(f'{share:5.1f}% {rate:7.1f}')
-        print(f'{row[0]:8d} {100 * row[-1] / cyc:6.1f}% ' + ' '.join(f'{c:>14}' for c in cells)
+        print(f'{row[0]:8d} {100 * row[-1] / cyc:6.1f}% {statistics.median(lengths[func]):7.0f} ' +
+              ' '.join(f'{c:>14}' for c in cells)
               + f'  {func[:90]}')
 
 if __name__ == '__main__':
