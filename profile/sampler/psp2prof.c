@@ -91,9 +91,11 @@ extern int module_get_offset(SceUID pid, SceUID modid, int segidx, size_t offset
 #define DIR "host0:/psp2prof/"
 
 // The four debug blocks, 0x2000 apart from 0xE3310000 (the PMU in the page after each).
-// DBGPCSR reads a recent PC of its core: the instruction's address plus 8 in ARM state and
-// plus 4 in Thumb state (bit 0 set); 0xFFFFFFFF when the core cannot be sampled. Reading needs
-// no unlock and writes nothing.
+// DBGPCSR reads a recent PC of its core, 0xFFFFFFFF when the core cannot be sampled. On the
+// Cortex-A9 it is the destination of the last branch the core executed (the target, or the next
+// instruction after a conditional branch not taken), with no offset: word-aligned in Thumb
+// state (bit 0 set), so a destination at 2 mod 4 reads 2 lower. A sample names the block from
+// there to the next branch, not one instruction. Reading needs no unlock and writes nothing.
 #define DBG_PA 0xE3310000u
 #define DBG_SIZE 0x8000u
 #define DBGPCSR 0x084u

@@ -295,8 +295,11 @@ def convert_p2pf(capture, elf: Path, module: str, output: Path):
             named.add((pid, thid))
             name = capture['threads'].get(thid, (pid, f'thread-{thid:08x}'))[1] or f'thread-{thid:08x}'
             events.append(record(RECORD_COMM, MISC_USER, struct.pack('<II', pid, thid) + text(name, 15)))
-        # DBGPCSR reads the instruction's address plus 8 in ARM state, plus 4 in Thumb (bit 0).
-        ip = relocate(pid, (pc & ~1) - (4 if pc & 1 else 8))
+        # The Cortex-A9's DBGPCSR reads the destination of the last branch its core executed (the
+        # target, or the next instruction after a conditional branch not taken), word-aligned in
+        # Thumb (bit 0 set), with no offset: the sample is in the block from there to the next
+        # branch. Taken as read.
+        ip = relocate(pid, pc & ~1)
         chain = [CONTEXT_USER, ip]
         if svc & 0x80000000 and ip < 0x40000000:
             # In a syscall: the svc instruction in its stub, then the stub's caller.

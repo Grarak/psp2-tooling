@@ -28,8 +28,8 @@ that powered down) is left out and counted as a reset. A stack snapshot (stack=)
 for several milliseconds and runs its loads on it: on the cores snapshots were taken of, every
 period that starts at a snapshot's sample (every hz/stackhz-th) is left out.
 
-A sample's PC is DBGPCSR's (the address of a recent instruction plus 8, plus 4 in Thumb):
-perf_data's correction is taken off by default; --raw-pc keeps the PC as read.
+A sample's PC is taken as DBGPCSR read it: on the Cortex-A9 the destination of the last branch
+(see perf_data), which names the function the core was in.
 
 PCs outside the ELF's text are grouped by the capture's module (MODL) they fall in.
 """
@@ -64,7 +64,6 @@ def main():
     parser.add_argument('--thread', help='only the periods whose sample caught this thread (by name)')
     parser.add_argument('--pid', type=lambda v: int(v, 0), help='only the periods of this process')
     parser.add_argument('--top', type=int, default=30)
-    parser.add_argument('--raw-pc', action='store_true', help='the PC as DBGPCSR read it')
     parser.add_argument('--max-cycles', type=int, help='leave out the periods longer than this')
     args = parser.parse_args()
 
@@ -78,9 +77,6 @@ def main():
     addrs = [a for a, _, _ in syms]
     mods = [(v, v + n, name, pid) for pid, ms in cap['modules'].items() for v, n, perm, name in ms
             if perm & 1]
-
-    def ip_of(pc):
-        return pc & ~1 if args.raw_pc else (pc & ~1) - (4 if pc & 1 else 8)
 
     def where(ip, pid):
         i = bisect.bisect_right(addrs, ip) - 1
@@ -139,7 +135,7 @@ def main():
             if args.max_cycles and delta[-1] > args.max_cycles:
                 long += 1
                 continue
-            ip = ip_of(s[1])
+            ip = s[1] & ~1
             func = where(ip, s[3])
             lengths[func].append(delta[-1])
             row = per[func]
