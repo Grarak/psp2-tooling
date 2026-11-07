@@ -20,11 +20,24 @@ and object are read, with the syscall it is in and the user code that called it,
 blocked thread the kernel calls below that syscall's frame (Thumb return addresses into kernel
 modules' code, a stack scan); each object waited on is named. waits.py reports them. A thread
 another process created is that process's: give the PID the samples show for it.
+
+--pmu EVENTS also counts up to six Cortex-A9 PMU events on each core in --pmu-cores (names as
+perf_data.PMU_EVENT_NAMES, or numbers: --pmu l1d-refill,l1d-access,dcache-stall-cycles), and the
+cycles: the plugin programs each core's Performance Monitors through their memory-mapped view
+and reads the counters right after each PC sample, so a counter's difference between two
+samples is what the core counted in that period. pmu_attr.py credits each period's counts to
+the function its sample landed in: a period is the whole time between two samples, so this tells
+apart phases longer than a period (sample one core at --hz 10000 for short ones). A core in WFI
+reads zeros, and a stack snapshot halts its core: pmu_attr.py leaves those periods out. What the
+PMU held before goes back after the capture (Sony's ScePerf programs the same registers).
 """
 import argparse
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from perf_data import PMU_EVENT_NAMES, pmu_event  # noqa: E402
 
 
 def main():
@@ -45,6 +58,10 @@ def main():
                         help="a process ID: its threads' states, running or blocked, read "
                              '--waits-hz times a second (profile/waits.py reports them)')
     parser.add_argument('--waits-hz', type=int, default=200, help='state reads a second (1..--hz)')
+    parser.add_argument('--pmu', default='',
+                        help='up to six PMU events, comma-separated names or numbers (default: none)')
+    parser.add_argument('--pmu-cores', type=lambda v: int(v, 0), default=0,
+                        help='cores whose PMU counts (default: --cores)')
     parser.add_argument('--timeout', type=float, default=30.0,
                         help='seconds past the capture to wait for its file')
     args = parser.parse_args()
@@ -57,8 +74,14 @@ def main():
     stack = (f' stack={args.stack} stackhz={args.stack_hz} stackcores={args.stack_cores or args.cores:#x}'
              if args.stack else '')
     waits = f' waits={args.waits:#x} waitshz={args.waits_hz}' if args.waits else ''
-    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x}{stack}{waits} '
-                       f'name={args.name}\n')
+    events = [pmu_event(e.strip()) for e in args.pmu.split(',') if e.strip()]
+    if len(events) > 6 or any(not 0 <= e <= 0xFF for e in events):
+        sys.exit('--pmu: up to six events, 0x00..0xFF: ' + ', '.join(
+            f'{n:#04x} {name}' for n, name in sorted(PMU_EVENT_NAMES.items())))
+    pmu = (f' pmu={",".join(f"{e:#x}" for e in events)} pmucores={args.pmu_cores or args.cores:#x}'
+           if events else '')
+    pending.write_text(f'seconds={args.seconds} hz={args.hz} cores={args.cores:#x}{stack}{waits}'
+                       f'{pmu} name={args.name}\n')
     pending.rename(request)
     end = time.monotonic() + args.seconds + args.timeout
     while time.monotonic() < end:
