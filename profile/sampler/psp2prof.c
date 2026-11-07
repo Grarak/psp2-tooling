@@ -31,6 +31,9 @@
 //   WOBJ  u32 wait id, u32 wait type, s32 result, char name[32]: each object the watched
 //         threads waited on, named by its Get*Info call (result: that call's, or 0x80020001 for
 //         a wait type without one)
+//   PMUC  (with pmu=EVENTS) u32 event count, u32 events[6], u32 core mask: the PMU's setup
+//   PMUS  PmuSample below: each sampled core's counters, read right after its SMPL sample
+//   PDRP  u32: PMU samples lost to a full ring, then the cores whose PMU could not be opened
 //   END   u32 0
 //
 // Stacks (stack=BYTES in the request, off by default): stackhz times a second (stackcores, cores
@@ -54,6 +57,19 @@
 // outermost first, so the kernel function that blocked is named too (a stack scan, not an
 // unwind: a stale word in a frame's padding can show up). Each wait object is named once, when
 // the capture first sees it.
+//
+// PMU counts (pmu=E0,E1,... in the request, up to six Cortex-A9 event numbers, off by default):
+// the sampler programs each sampled core's Performance Monitors through their memory-mapped view
+// (the page after the core's debug block, software lock opened as for stacks) with those events,
+// starts the six event counters and the cycle counter from zero, and reads all seven right after
+// each PC sample of that core, the same tick. The difference of two reads is what the core
+// counted in the period that ended at the later sample. A core in WFI (the idle thread) answers
+// the reads with zeros, and one that enters or leaves WFI during them gives zeros for some (its
+// counters keep their counts); a stack snapshot halts its core and runs its own loads on it.
+// Both are left in the records as read: pmu_attr.py leaves those periods out. What the PMU held
+// before (its event types, enables, interrupt enables and PMCR) is put back after the capture;
+// Sony's ScePerf programs the same registers, so a capture with pmu= overrides a Razor capture's
+// counters while it lasts.
 
 #include <psp2kern/io/dirent.h>
 #include <psp2kern/io/fcntl.h>
@@ -174,6 +190,32 @@ typedef struct Sample {
 
 #define RING 65536u   // samples, 2 MiB
 #define CHUNK 1024u   // samples a SMPL record
+
+// The Performance Monitors' memory-mapped view (ARMv7), PMU_OFF past each core's debug block:
+// the event counters at 4n, the cycle counter at 0x07C, the event types at 0x400 + 4n, the
+// enables, overflow flags, control and software lock as named.
+#define PMU_OFF 0x1000u
+#define PMXEVCNTR(n) (0x000u + 4u * (n))
+#define PMCCNTR 0x07Cu
+#define PMXEVTYPER(n) (0x400u + 4u * (n))
+#define PMCNTENSET 0xC00u
+#define PMCNTENCLR 0xC20u
+#define PMINTENSET 0xC40u
+#define PMINTENCLR 0xC60u
+#define PMOVSR 0xC80u
+#define PMCR 0xE04u
+#define PMLAR 0xFB0u
+#define PMLSR 0xFB4u
+#define PMCR_E 1u // counters enabled
+#define PMCR_P 2u // event counters to zero
+#define PMCR_C 4u // cycle counter to zero
+#define PMCR_D 8u // cycle counter every 64 cycles
+#define PMU_EVENTS 6u
+
+typedef struct PmuSample {
+    uint32_t cpu;                   // core | read sequence << 2, as the Sample read just before
+    uint32_t count[PMU_EVENTS + 1]; // the event counters, then the cycle counter
+} PmuSample;
 #define MAX_THREADS 2048u
 #define MAX_PIDS 64u
 
@@ -198,6 +240,13 @@ static uint32_t wait_pid, wait_every;
 static uint32_t watched_thid[WAIT_THREADS], watched_obj[WAIT_THREADS];
 static volatile uint32_t watched;
 static WaitSample wait_chunk[CHUNK];
+static SceUID pmu_uid = -1;
+static PmuSample *pmu_ring;
+static volatile uint32_t pmu_head, pmu_tail, pmu_dropped;
+static uint32_t pmu_events[PMU_EVENTS], pmu_nevents, pmu_mask, pmu_failed, pmu_relock;
+// What each core's PMU held before the capture: its event types, PMCR, PMCNTENSET, PMINTENSET.
+static uint32_t pmu_saved[4][PMU_EVENTS + 3];
+static PmuSample pmu_chunk[CHUNK];
 static uint32_t ktext_lo[KTEXT_MAX], ktext_hi[KTEXT_MAX], nktext; // sorted by ktext_lo
 typedef struct WaitObject {
     uint32_t id, type;
@@ -525,6 +574,25 @@ static int sampler(SceSize args, void *argp) {
             }
             asm volatile("dmb" ::: "memory");
             head = h + 1;
+            if (pmu_mask & (1u << cpu)) {
+                const uint32_t ph = pmu_head;
+                if (ph - pmu_tail >= RING) {
+                    pmu_dropped++;
+                } else {
+                    PmuSample *ps = &pmu_ring[ph & (RING - 1)];
+                    volatile const uint32_t *const m = dbg + (cpu * 0x2000u + PMU_OFF) / 4;
+                    ps->cpu = cpu | seq << 2;
+                    for (uint32_t n = 0; n < pmu_nevents; n++) {
+                        ps->count[n] = m[PMXEVCNTR(n) / 4];
+                    }
+                    for (uint32_t n = pmu_nevents; n < PMU_EVENTS; n++) {
+                        ps->count[n] = 0;
+                    }
+                    ps->count[PMU_EVENTS] = m[PMCCNTR / 4];
+                    asm volatile("dmb" ::: "memory");
+                    pmu_head = ph + 1;
+                }
+            }
             if (stack_bytes && stack_mask & (1u << cpu) && seq % stack_every == 0) {
                 snapshot(cpu, now, s->thid, s->pid);
             }
@@ -566,6 +634,74 @@ static volatile const uint8_t *find_cpucb(void) {
     return priv;
 }
 
+// The PMUs of the cores in `mask` that allow it: powered (a powered-down core's view does not
+// answer) and not OS-locked, the software lock opened for the capture. Each one's state saved,
+// its counters set to pmu_events, zeroed and started. Returns those cores.
+static uint32_t open_pmu(uint32_t mask) {
+    uint32_t usable = 0;
+    for (uint32_t cpu = 0; cpu < 4; cpu++) {
+        if (!(mask & (1u << cpu))) {
+            continue;
+        }
+        volatile uint32_t *const d = dbg + cpu * 0x2000u / 4;
+        volatile uint32_t *const m = dbg + (cpu * 0x2000u + PMU_OFF) / 4;
+        if (!(d[DBGPRSR / 4] & 1u) || d[DBGOSLSR / 4] & 2u) {
+            ksceKernelPrintf("[psp2prof] cpu%u: no PMU (DBGPRSR %08X DBGOSLSR %08X)\n", cpu,
+                             d[DBGPRSR / 4], d[DBGOSLSR / 4]);
+            continue;
+        }
+        if (m[PMLSR / 4] & 2u) {
+            m[PMLAR / 4] = 0xC5ACCE55u;
+            pmu_relock |= 1u << cpu;
+        }
+        uint32_t *const saved = pmu_saved[cpu];
+        for (uint32_t n = 0; n < PMU_EVENTS; n++) {
+            saved[n] = m[PMXEVTYPER(n) / 4];
+        }
+        saved[PMU_EVENTS] = m[PMCR / 4];
+        saved[PMU_EVENTS + 1] = m[PMCNTENSET / 4];
+        saved[PMU_EVENTS + 2] = m[PMINTENSET / 4];
+        if (saved[PMU_EVENTS] & PMCR_E) {
+            ksceKernelPrintf("[psp2prof] cpu%u: the PMU was counting (PMCR %08X, counters %08X): "
+                             "its setup is put back after the capture\n",
+                             cpu, saved[PMU_EVENTS], saved[PMU_EVENTS + 1]);
+        }
+        m[PMCNTENCLR / 4] = 0xFFFFFFFFu;
+        m[PMINTENCLR / 4] = 0xFFFFFFFFu;
+        for (uint32_t n = 0; n < pmu_nevents; n++) {
+            m[PMXEVTYPER(n) / 4] = pmu_events[n];
+        }
+        m[PMOVSR / 4] = 0xFFFFFFFFu;
+        m[PMCR / 4] = (saved[PMU_EVENTS] & ~PMCR_D) | PMCR_E | PMCR_P | PMCR_C;
+        m[PMCNTENSET / 4] = 0x80000000u | ((1u << pmu_nevents) - 1u);
+        usable |= 1u << cpu;
+    }
+    return usable;
+}
+
+// The PMUs open_pmu took back as they were, their software locks closed again.
+static void close_pmu(void) {
+    for (uint32_t cpu = 0; cpu < 4; cpu++) {
+        if (!(pmu_mask & (1u << cpu))) {
+            continue;
+        }
+        volatile uint32_t *const m = dbg + (cpu * 0x2000u + PMU_OFF) / 4;
+        const uint32_t *const saved = pmu_saved[cpu];
+        m[PMCNTENCLR / 4] = 0xFFFFFFFFu;
+        for (uint32_t n = 0; n < PMU_EVENTS; n++) {
+            m[PMXEVTYPER(n) / 4] = saved[n];
+        }
+        m[PMOVSR / 4] = 0xFFFFFFFFu;
+        m[PMINTENSET / 4] = saved[PMU_EVENTS + 2];
+        m[PMCR / 4] = saved[PMU_EVENTS] & ~(PMCR_P | PMCR_C);
+        m[PMCNTENSET / 4] = saved[PMU_EVENTS + 1];
+        if (pmu_relock & (1u << cpu)) {
+            m[PMLAR / 4] = 0;
+        }
+    }
+    pmu_mask = pmu_relock = 0;
+}
+
 static void stop_sampler(void) {
     if (sampler_thid >= 0) {
         sampling = 0;
@@ -580,6 +716,7 @@ static void stop_sampler(void) {
         }
     }
     stack_relock = 0;
+    close_pmu();
 }
 
 // Stacks on the cores in `mask` that allow them: powered, not OS-locked (whoever set the OS lock
@@ -606,7 +743,8 @@ static uint32_t open_stacks(uint32_t mask) {
 }
 
 static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t stack_hz,
-                         uint32_t stack_cores, uint32_t waits, uint32_t waits_hz) {
+                         uint32_t stack_cores, uint32_t waits, uint32_t waits_hz,
+                         uint32_t pmu_cores) {
     if (!cpucb && !(cpucb = find_cpucb())) {
         ksceKernelPrintf("[psp2prof] SceKernelThreadMgr's per-CPU blocks not found (not 3.65?)\n");
         return -1;
@@ -668,7 +806,24 @@ static int start_sampler(uint32_t hz, uint32_t cores, uint32_t stack, uint32_t s
         }
         wait_ring = base;
     }
+    if (pmu_nevents && pmu_uid < 0) {
+        void *base = NULL;
+        pmu_uid = ksceKernelAllocMemBlock("psp2prof_pmu", SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_RW,
+                                          RING * sizeof(PmuSample), NULL);
+        if (pmu_uid < 0)
+            pmu_uid = ksceKernelAllocMemBlock("psp2prof_pmu", 0x1080d006, RING * sizeof(PmuSample),
+                                              NULL);
+        if (pmu_uid < 0 || ksceKernelGetMemBlockBase(pmu_uid, &base) < 0) {
+            ksceKernelPrintf("[psp2prof] the PMU ring failed: 0x%08X\n", pmu_uid);
+            pmu_uid = -1;
+            return -1;
+        }
+        pmu_ring = base;
+    }
     head = tail = dropped = 0;
+    pmu_head = pmu_tail = pmu_dropped = 0;
+    pmu_mask = pmu_nevents ? open_pmu(pmu_cores) : 0;
+    pmu_failed = pmu_nevents ? pmu_cores & ~pmu_mask : 0;
     stack_head = stack_tail = stack_dropped = 0;
     wait_head = wait_tail = wait_dropped = 0;
     watched = 0;
@@ -899,12 +1054,40 @@ static int drain(SceUID fd, uint32_t *count) {
     return 0;
 }
 
+static int drain_pmu(SceUID fd, uint32_t *count) {
+    static uint32_t filled;
+    const uint32_t h = pmu_head;
+    while (pmu_tail != h) {
+        pmu_chunk[filled++] = pmu_ring[pmu_tail & (RING - 1)];
+        pmu_tail++;
+        if (filled == CHUNK) {
+            if (put(fd, "PMUS", pmu_chunk, sizeof(pmu_chunk)) < 0) {
+                return -1;
+            }
+            *count += filled;
+            filled = 0;
+        }
+    }
+    if (!sampling && filled) {
+        if (put(fd, "PMUS", pmu_chunk, filled * sizeof(PmuSample)) < 0) {
+            return -1;
+        }
+        *count += filled;
+        filled = 0;
+    }
+    return 0;
+}
+
 // The drains during the window. A host0: write holds host0:'s file lock for its USB round trip
 // (about 0.2 s for 64 KiB, measured 2026-10-29), stalling the profiled app's own host0: I/O
 // behind it, so the rings keep the capture until the window ends and only one 3/4 full is
 // drained early. Stack snapshots (STACK_RING slots) are written as they come all the same.
-static int drain_window(SceUID fd, uint32_t *count, uint32_t *stacks, uint32_t *waited) {
+static int drain_window(SceUID fd, uint32_t *count, uint32_t *stacks, uint32_t *waited,
+                        uint32_t *counted) {
     if (head - tail >= RING / 4 * 3 && drain(fd, count) < 0) {
+        return -1;
+    }
+    if (pmu_head - pmu_tail >= RING / 4 * 3 && drain_pmu(fd, counted) < 0) {
         return -1;
     }
     if (drain_stacks(fd, stacks) < 0) {
@@ -987,7 +1170,7 @@ static void note_text(SceUID fd, uint32_t pid, const SceKernelModuleInfo *info, 
 
 static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stack,
                     uint32_t stack_hz, uint32_t stack_cores, uint32_t waits, uint32_t waits_hz,
-                    const char *name) {
+                    uint32_t pmu_cores, const char *name) {
     char part[96], done[96];
     snprintf(part, sizeof(part), DIR "%s.part", name);
     snprintf(done, sizeof(done), DIR "%s.p2pf", name);
@@ -1004,27 +1187,40 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
         nktext = 0;
         each_segment(-1, KERNEL_PID, note_text);
     }
-    const int auth = start_sampler(hz, cores, stack, stack_hz, stack_cores, waits, waits_hz);
+    const int auth =
+        start_sampler(hz, cores, stack, stack_hz, stack_cores, waits, waits_hz, pmu_cores);
     const uint32_t header[8] = {0x46503250, 1, hz, cores, (uint32_t)auth, 0, 0, 0}; // P2PF
-    uint32_t count = 0, stacks = 0, waited = 0;
+    uint32_t count = 0, stacks = 0, waited = 0, counted = 0;
     out_len = window_bytes = 0;
     out_failed = 0;
     emit(fd, header, sizeof(header));
+    if (pmu_nevents) {
+        uint32_t pmuc[PMU_EVENTS + 2] = {pmu_nevents};
+        for (uint32_t n = 0; n < PMU_EVENTS; n++) {
+            pmuc[1 + n] = n < pmu_nevents ? pmu_events[n] : 0;
+        }
+        pmuc[PMU_EVENTS + 1] = pmu_mask;
+        put(fd, "PMUC", pmuc, sizeof(pmuc));
+    }
     int failed = auth < 0;
     const uint32_t start = ksceKernelGetSystemTimeLow();
     while (!failed && !unloading && ksceKernelGetSystemTimeLow() - start < seconds * 1000000u) {
         ksceKernelDelayThread(20000);
-        failed = drain_window(fd, &count, &stacks, &waited) < 0;
+        failed = drain_window(fd, &count, &stacks, &waited, &counted) < 0;
     }
     stop_sampler();
     failed = failed || drain(fd, &count) < 0 || drain_stacks(fd, &stacks) < 0 ||
-             drain_waits(fd, &waited) < 0;
+             drain_waits(fd, &waited) < 0 || drain_pmu(fd, &counted) < 0;
     const uint32_t lost = dropped;
     put(fd, "DROP", &lost, sizeof(lost));
     if (stack) {
         const uint32_t sdrp[5] = {stack_dropped, stack_kernel, stack_busy, stack_no_halt,
                                   stack_no_step};
         put(fd, "SDRP", sdrp, sizeof(sdrp));
+    }
+    if (pmu_nevents) {
+        const uint32_t pdrp[2] = {pmu_dropped, pmu_failed};
+        put(fd, "PDRP", pdrp, sizeof(pdrp));
     }
     if (waits) {
         const uint32_t wdrp[2] = {wait_dropped, watched};
@@ -1081,6 +1277,10 @@ static void capture(uint32_t seconds, uint32_t hz, uint32_t cores, uint32_t stac
                          done, stacks, stack_dropped, stack_kernel, stack_busy, stack_no_halt,
                          stack_no_step);
     }
+    if (pmu_nevents) {
+        ksceKernelPrintf("[psp2prof] %s: %u PMU samples, %u dropped; cores not counted 0x%X\n",
+                         done, counted, pmu_dropped, pmu_failed);
+    }
     if (waits) {
         ksceKernelPrintf("[psp2prof] %s: %u wait samples of %u threads, %u dropped; %u wait "
                          "objects, %u kernel code segments\n",
@@ -1112,12 +1312,15 @@ static uint32_t number(const char *text) {
 }
 
 // "seconds=S hz=H cores=MASK name=NAME" (defaults 4, 1000, 0x7, capture), for stacks
-// "stack=BYTES stackhz=H stackcores=MASK" (defaults 0: none, 100, the cores), and for waits
-// "waits=PID waitshz=H" (defaults 0: none, 200); a name keeps [A-Za-z0-9._-] only.
+// "stack=BYTES stackhz=H stackcores=MASK" (defaults 0: none, 100, the cores), for waits
+// "waits=PID waitshz=H" (defaults 0: none, 200), and for PMU counts "pmu=E0,E1,..." (up to six
+// event numbers, 0x for hex) "pmucores=MASK" (the cores by default); a name keeps
+// [A-Za-z0-9._-] only.
 static void request(char *text) {
     uint32_t seconds = 4, hz = 1000, cores = 0x7, stack = 0, stack_hz = 100, stack_cores = 0;
-    uint32_t waits = 0, waits_hz = 200;
+    uint32_t waits = 0, waits_hz = 200, pmu_cores = 0;
     char name[48] = "capture";
+    pmu_nevents = 0;
     for (char *p = text; *p;) {
         while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') {
             p++;
@@ -1138,6 +1341,18 @@ static void request(char *text) {
             waits = number(p + 6);
         } else if (!strncmp(p, "waitshz=", 8)) {
             waits_hz = number(p + 8);
+        } else if (!strncmp(p, "pmucores=", 9)) {
+            pmu_cores = number(p + 9);
+        } else if (!strncmp(p, "pmu=", 4)) {
+            for (const char *q = p + 4; *q && *q != ' ' && *q != '\n' && pmu_nevents < PMU_EVENTS;) {
+                pmu_events[pmu_nevents++] = number(q) & 0xFFu;
+                while (*q && *q != ',' && *q != ' ' && *q != '\n') {
+                    q++;
+                }
+                if (*q == ',') {
+                    q++;
+                }
+            }
         } else if (!strncmp(p, "name=", 5)) {
             uint32_t n = 0;
             for (const char *q = p + 5; *q && n < sizeof(name) - 1; q++) {
@@ -1155,13 +1370,14 @@ static void request(char *text) {
         }
     }
     stack_cores = stack_cores ? stack_cores : cores;
+    pmu_cores = pmu_cores ? pmu_cores : cores;
     if (!seconds || seconds > 600 || hz < 10 || hz > 10000 || !cores || cores > 0xF || !name[0] ||
         (stack && (stack < 64 || stack > STACK_MAX || stack % 256 || !stack_hz || stack_hz > hz ||
                    stack_cores & ~cores & 0xFu || stack_cores & 8u)) ||
-        (waits && (!waits_hz || waits_hz > hz))) {
+        (waits && (!waits_hz || waits_hz > hz)) || (pmu_nevents && pmu_cores & ~cores & 0xFu)) {
         ksceKernelPrintf("[psp2prof] refused: seconds 1..600, hz 10..10000, cores 0x1..0xF; stack "
                          "256..%u in 256s, stackhz 1..hz, stackcores within cores, not core 3; "
-                         "waitshz 1..hz\n",
+                         "waitshz 1..hz; pmucores within cores\n",
                          STACK_MAX);
         return;
     }
@@ -1175,7 +1391,13 @@ static void request(char *text) {
         ksceKernelPrintf("[psp2prof] with waits: process 0x%X's threads at %u Hz\n", waits,
                          waits_hz);
     }
-    capture(seconds, hz, cores, stack, stack_hz, stack_cores, waits, waits_hz, name);
+    if (pmu_nevents) {
+        ksceKernelPrintf("[psp2prof] with PMU counts: %u events (0x%02X 0x%02X 0x%02X 0x%02X "
+                         "0x%02X 0x%02X) and cycles, cores 0x%X\n",
+                         pmu_nevents, pmu_events[0], pmu_events[1], pmu_events[2], pmu_events[3],
+                         pmu_events[4], pmu_events[5], pmu_cores);
+    }
+    capture(seconds, hz, cores, stack, stack_hz, stack_cores, waits, waits_hz, pmu_cores, name);
 }
 
 static int control(SceSize args, void *argp) {
